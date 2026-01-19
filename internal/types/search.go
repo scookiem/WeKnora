@@ -126,7 +126,7 @@ type Pagination struct {
 	// Page size
 	PageSize int `form:"page_size" json:"page_size" binding:"omitempty,min=1,max=100"`
 	// External user ID
-	ExternalUserId string `json:"external_user_id"`
+	ExternalUserId string `form:"external_user_id" json:"external_user_id"`
 }
 
 // GetPage gets the page number, default is 1
