@@ -12,6 +12,8 @@ type CreateSessionRequest struct {
 	Title string `json:"title"`
 	// Description for the session (optional)
 	Description string `json:"description"`
+	// External user ID for the session (optional)
+	ExternalUserId string `json:"external_user_id"`
 }
 
 // GenerateTitleRequest defines the request structure for generating a session title

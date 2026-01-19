@@ -81,6 +81,8 @@ type Session struct {
 	Description string `json:"description"`
 	// Tenant ID
 	TenantID uint64 `json:"tenant_id"   gorm:"index"`
+	// External user ID
+	ExternalUserId string `json:"external_user_id"`
 
 	// // Strategy configuration
 	// KnowledgeBaseID   string              `json:"knowledge_base_id"`                    // 关联的知识库ID
