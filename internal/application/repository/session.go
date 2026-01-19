@@ -68,12 +68,11 @@ func (r *sessionRepository) GetPagedByTenantID(
 		Where("tenant_id = ?", tenantID).
 		Order("created_at DESC").
 		Offset(page.Offset()).
-		Limit(page.Limit()).
-		Find(&sessions)
+		Limit(page.Limit())
 	if page.ExternalUserId != "" {
 		query.Where("external_user_id = ?", page.ExternalUserId)
 	}
-	err = query.Error
+	err = query.Find(&sessions).Error
 	if err != nil {
 		return nil, 0, err
 	}
