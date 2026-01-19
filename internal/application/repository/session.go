@@ -64,12 +64,16 @@ func (r *sessionRepository) GetPagedByTenantID(
 	}
 
 	// Then query the paginated data
-	err = r.db.WithContext(ctx).
+	query := r.db.WithContext(ctx).
 		Where("tenant_id = ?", tenantID).
 		Order("created_at DESC").
 		Offset(page.Offset()).
 		Limit(page.Limit()).
-		Find(&sessions).Error
+		Find(&sessions)
+	if page.ExternalUserId != "" {
+		query.Where("external_user_id = ?", page.ExternalUserId)
+	}
+	err = query.Error
 	if err != nil {
 		return nil, 0, err
 	}

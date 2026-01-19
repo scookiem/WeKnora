@@ -88,9 +88,10 @@ func (h *Handler) CreateSession(c *gin.Context) {
 
 	// Create session object with base properties
 	createdSession := &types.Session{
-		TenantID:    tenantID.(uint64),
-		Title:       request.Title,
-		Description: request.Description,
+		TenantID:       tenantID.(uint64),
+		ExternalUserId: request.ExternalUserId,
+		Title:          request.Title,
+		Description:    request.Description,
 	}
 
 	// Call service to create session
