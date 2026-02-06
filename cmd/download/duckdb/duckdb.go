@@ -16,7 +16,10 @@ func downloadSpatial() {
 	}
 
 	// Try to install spatial extension (may already be installed or network unavailable)
-	installSQL := "INSTALL spatial;"
+	//在线下载 spatial.duckdb_extension
+	//installSQL := "INSTALL spatial;"
+	//离线安装
+	installSQL := "INSTALL '/app/cmd/download/duckdb/spatial.duckdb_extension';"
 	if _, err := sqlDB.ExecContext(ctx, installSQL); err != nil {
 		panic(err)
 	}
