@@ -143,7 +143,7 @@ build_app_image() {
         --build-arg BUILD_TIME_ARG="$BUILD_TIME" \
         --build-arg GO_VERSION_ARG="$GO_VERSION" \
         -f docker/Dockerfile.app \
-        -t wechatopenai/weknora-app:latest \
+        -t wechatopenai/weknora-app:local \
         .
     
     if [ $? -eq 0 ]; then
@@ -187,7 +187,7 @@ build_frontend_image() {
     docker build \
         --platform $PLATFORM \
         -f frontend/Dockerfile \
-        -t wechatopenai/weknora-ui:latest \
+        -t wechatopenai/weknora-ui:local \
         frontend/
     
     if [ $? -eq 0 ]; then
