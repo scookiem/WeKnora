@@ -368,7 +368,7 @@ start_docker() {
 	else
 		# 拉取最新镜像
 		log_info "拉取最新镜像..."
-		PLATFORM=$PLATFORM "$DOCKER_COMPOSE_BIN" $DOCKER_COMPOSE_SUBCMD -p weknora up -d
+		PLATFORM=$PLATFORM "$DOCKER_COMPOSE_BIN" $DOCKER_COMPOSE_SUBCMD up -d
 	fi
     if [ $? -ne 0 ]; then
         log_error "Docker容器启动失败"
