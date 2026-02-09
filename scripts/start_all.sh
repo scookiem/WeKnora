@@ -368,7 +368,7 @@ start_docker() {
 	else
 		# 拉取最新镜像
 		log_info "拉取最新镜像..."
-		PLATFORM=$PLATFORM "$DOCKER_COMPOSE_BIN" $DOCKER_COMPOSE_SUBCMD up --pull always -d
+		PLATFORM=$PLATFORM "$DOCKER_COMPOSE_BIN" $DOCKER_COMPOSE_SUBCMD -p weknora up -d
 	fi
     if [ $? -ne 0 ]; then
         log_error "Docker容器启动失败"
@@ -379,7 +379,7 @@ start_docker() {
 
     # 显示容器状态
     log_info "当前容器状态:"
-	"$DOCKER_COMPOSE_BIN" $DOCKER_COMPOSE_SUBCMD ps
+    "$DOCKER_COMPOSE_BIN" $DOCKER_COMPOSE_SUBCMD ps
 
     # 预拉取Sandbox镜像（Agent Skills 执行所需，仅拉取不启动）
     ensure_sandbox_image
@@ -402,7 +402,7 @@ stop_docker() {
     cd "$PROJECT_ROOT"
     
     # 停止所有容器
-	"$DOCKER_COMPOSE_BIN" $DOCKER_COMPOSE_SUBCMD down --remove-orphans
+	"$DOCKER_COMPOSE_BIN" $DOCKER_COMPOSE_SUBCMD -p weknora down --remove-orphans
     if [ $? -ne 0 ]; then
         log_error "Docker容器停止失败"
         return 1
@@ -427,7 +427,7 @@ list_containers() {
     
     # 列出所有容器
     printf "%b\n" "${BLUE}当前正在运行的容器:${NC}"
-	"$DOCKER_COMPOSE_BIN" $DOCKER_COMPOSE_SUBCMD ps --services | sort
+	"$DOCKER_COMPOSE_BIN" $DOCKER_COMPOSE_SUBCMD -p weknora ps --services | sort
     
     return 0
 }
