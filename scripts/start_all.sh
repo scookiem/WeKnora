@@ -622,7 +622,7 @@ CONTAINER_NAME=""
 
 # 没有参数时默认启动所有服务
 if [ $# -eq 0 ]; then
-    START_OLLAMA=true
+    START_OLLAMA=false
     START_DOCKER=true
 fi
 
