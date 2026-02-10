@@ -15,8 +15,9 @@ ENV GOPROXY=${GOPROXY_ARG}
 ENV GOSUMDB=${GOSUMDB_ARG}
 
 # Install dependencies
-RUN sed -i -E 's@https?://deb\.debian\.org(/debian)@https://mirrors.cloud.tencent.com\1@g' /etc/apt/sources.list.d/debian.sources && \
-    sed -i -E 's@https?://security\.debian\.org(/debian-security)@https://mirrors.cloud.tencent.com/debian-archive/debian-security@g' /etc/apt/sources.list.d/debian.sources && \
+RUN if [ -n "$APK_MIRROR_ARG" ]; then \
+        sed -i "s@deb.debian.org@${APK_MIRROR_ARG}@g" /etc/apt/sources.list.d/debian.sources; \
+    fi && \
     apt-get update && \
     apt-get install -y git build-essential
 
@@ -55,8 +56,9 @@ ARG APK_MIRROR_ARG=mirrors.cloud.tencent.com
 # Create a non-root user first
 RUN useradd -m -s /bin/bash appuser
 
-RUN sed -i -E 's@https?://deb\.debian\.org(/debian)@https://mirrors.cloud.tencent.com\1@g' /etc/apt/sources.list.d/debian.sources && \
-    sed -i -E 's@https?://security\.debian\.org(/debian-security)@https://mirrors.cloud.tencent.com\1@g' /etc/apt/sources.list.d/debian.sources && \
+RUN if [ -n "$APK_MIRROR_ARG" ]; then \
+        sed -i "s@deb.debian.org@${APK_MIRROR_ARG}@g" /etc/apt/sources.list.d/debian.sources; \
+    fi && \
     apt-get update && \
     apt-get install -y --no-install-recommends \
         build-essential postgresql-client default-mysql-client ca-certificates tzdata sed curl bash vim wget \
