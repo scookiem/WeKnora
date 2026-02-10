@@ -55,9 +55,7 @@ ARG APK_MIRROR_ARG=mirrors.cloud.tencent.com
 # Create a non-root user first
 RUN useradd -m -s /bin/bash appuser
 
-RUN sed -i -E 's@https?://deb\.debian\.org(/debian)@https://mirrors.cloud.tencent.com\1@g' /etc/apt/sources.list.d/debian.sources && \
-    sed -i -E 's@https?://security\.debian\.org(/debian-security)@https://mirrors.cloud.tencent.com/debian-archive/debian-security@g' /etc/apt/sources.list.d/debian.sources && \
-    apt-get update && \
+RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         build-essential postgresql-client default-mysql-client ca-certificates tzdata sed curl bash vim wget \
         python3 python3-pip python3-dev libffi-dev libssl-dev \
