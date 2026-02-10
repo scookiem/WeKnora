@@ -51,7 +51,7 @@ FROM debian:12.12-slim
 
 WORKDIR /app
 
-ARG APK_MIRROR_ARG=mirrors.cloud.tencent.com
+ARG APK_MIRROR_ARG
 
 # Create a non-root user first
 RUN useradd -m -s /bin/bash appuser
