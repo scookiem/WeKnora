@@ -153,11 +153,11 @@ services:
       - COS_PATH_PREFIX=${COS_PATH_PREFIX:-}
       - COS_ENABLE_OLD_DOMAIN=${COS_ENABLE_OLD_DOMAIN:-}
 #     - VLM_MODEL_BASE_URL=${OLLAMA_BASE_URL}/v1
-      - VLM_MODEL_BASE_URL=http://192.168.66.200:9010/v1
+      - VLM_MODEL_BASE_URL=http://host.docker.internal:9010/v1
       - VLM_MODEL_NAME=Qwen/Qwen3-VL-32B-Instruct
       - VLM_MODEL_API_KEY=sk-Riuupu8n4XLg6yCsfya6rkm2cgUWqojh3OmHq1GS7oF2aQas
       - STORAGE_TYPE=${STORAGE_TYPE:-}
-      - MINIO_PUBLIC_ENDPOINT=http://192.168.66.200:${MINIO_PORT:-9000}
+      - MINIO_PUBLIC_ENDPOINT=http://host.docker.internal:${MINIO_PORT:-9000}
       - MINIO_ENDPOINT=minio:9000
       - MINIO_ACCESS_KEY_ID=${MINIO_ACCESS_KEY_ID:-minioadmin}
       - MINIO_SECRET_ACCESS_KEY=${MINIO_SECRET_ACCESS_KEY:-minioadmin}
