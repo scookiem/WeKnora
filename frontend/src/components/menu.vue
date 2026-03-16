@@ -4,7 +4,7 @@
             <img class="logo" src="@/assets/img/atia.png" alt="">
         </div>
         <!-- 折叠时：展开按钮 -->
-        <t-tooltip v-else :content="t('menu.expandSidebar')" placement="right">
+        <t-tooltip v-if="uiStore.sidebarCollapsed" :content="t('menu.expandSidebar')" placement="right">
             <div class="menu_item sidebar-toggle-item" @click="uiStore.toggleSidebar">
                 <div class="menu_item-box">
                     <div class="menu_icon">
