@@ -53,20 +53,31 @@ FROM debian:12.12-slim
 WORKDIR /app
 
 ARG APK_MIRROR_ARG
+ARG NODE_VERSION_ARG=20
 
 # Create a non-root user first
 RUN useradd -m -s /bin/bash appuser
 
+# Configure mirror and install dependencies
 RUN if [ -n "$APK_MIRROR_ARG" ]; then \
-        sed -i "s@deb.debian.org@${APK_MIRROR_ARG}@g" /etc/apt/sources.list.d/debian.sources; \
+        # Handle DEB822 format for Debian 12+
+        if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+            sed -i "s|URIs: http://deb.debian.org|URIs: http://${APK_MIRROR_ARG}|g" /etc/apt/sources.list.d/debian.sources; \
+            sed -i "s|URIs: http://security.debian.org|URIs: http://${APK_MIRROR_ARG}|g" /etc/apt/sources.list.d/debian.sources; \
+        fi; \
     fi && \
     apt-get update && \
     apt-get install -y --no-install-recommends \
-        build-essential postgresql-client default-mysql-client ca-certificates tzdata sed curl bash vim wget \
+        build-essential postgresql-client default-mysql-client ca-certificates tzdata sed curl bash vim wget gnupg \
         libsqlite3-0 \
         python3 python3-pip python3-dev libffi-dev libssl-dev \
-        nodejs npm \
         gosu && \
+    # Install Node.js from NodeSource (Debian 12 doesn't have nodejs in default repos)
+    mkdir -p /etc/apt/keyrings && \
+    curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg && \
+    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_${NODE_VERSION_ARG}.x nodistro main" | tee /etc/apt/sources.list.d/nodesource.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends nodejs && \
     python3 -m pip install --break-system-packages --upgrade pip setuptools wheel && \
     mkdir -p /home/appuser/.local/bin && \
     curl -LsSf https://astral.sh/uv/install.sh | CARGO_HOME=/home/appuser/.cargo UV_INSTALL_DIR=/home/appuser/.local/bin sh && \
