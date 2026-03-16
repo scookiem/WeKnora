@@ -27,10 +27,13 @@ import {
   uploadKnowledgeFile,
   createKnowledgeFromURL,
   listKnowledgeBases,
+  reparseKnowledge,
 } from "@/api/knowledge-base/index";
 import FAQEntryManager from './components/FAQEntryManager.vue';
+import { listMoveTargets, moveKnowledge, getKnowledgeMoveProgress } from '@/api/knowledge-base';
 import { useI18n } from 'vue-i18n';
 import { formatStringDate, kbFileTypeVerification } from '@/utils';
+import { getParserEngines, type ParserEngineInfo } from '@/api/system';
 const route = useRoute();
 const { t } = useI18n();
 const kbId = computed(() => (route.params as any).kbId as string || '');
@@ -40,6 +43,62 @@ const folderUploadInputRef = ref<HTMLInputElement | null>(null);
 const uploading = ref(false);
 const kbLoading = ref(false);
 const isFAQ = computed(() => (kbInfo.value?.type || '') === 'faq');
+const parserEngines = ref<ParserEngineInfo[]>([]);
+
+const supportedFileTypes = computed<Set<string>>(() => {
+  const engines = parserEngines.value
+  if (!engines.length) return new Set<string>()
+
+  const rules: { file_types: string[]; engine: string }[] =
+    kbInfo.value?.chunking_config?.parser_engine_rules || []
+
+  const ruleMap = new Map<string, string>()
+  for (const r of rules) {
+    for (const ft of r.file_types) ruleMap.set(ft, r.engine)
+  }
+
+  const available = new Set<string>()
+  const availableEngineNames = new Set(
+    engines.filter(e => e.Available !== false).map(e => e.Name)
+  )
+
+  for (const engine of engines) {
+    for (const ft of engine.FileTypes || []) {
+      if (available.has(ft)) continue
+
+      const explicitEngine = ruleMap.get(ft)
+      if (explicitEngine) {
+        if (availableEngineNames.has(explicitEngine)) available.add(ft)
+      } else {
+        if (engine.Available !== false) available.add(ft)
+      }
+    }
+  }
+  return available
+})
+
+const acceptFileTypes = computed(() =>
+  [...supportedFileTypes.value].map(t => '.' + t).join(',')
+)
+
+const unsupportedFileTypes = computed<string[]>(() => {
+  const engines = parserEngines.value
+  if (!engines.length) return []
+
+  const allTypes = new Set<string>()
+  for (const engine of engines) {
+    for (const ft of engine.FileTypes || []) allTypes.add(ft)
+  }
+
+  const supported = supportedFileTypes.value
+  return [...allTypes].filter(ft => !supported.has(ft)).sort()
+})
+
+const goToParserSettings = () => {
+  if (kbId.value) {
+    uiStore.openKBSettings(kbId.value, 'parser')
+  }
+}
 
 // Permission control: check if current user owns this KB or has edit/manage permission
 const isOwner = computed(() => {
@@ -93,7 +152,13 @@ const kbLastUpdated = computed(() => {
 });
 
 const knowledgeList = ref<Array<{ id: string; name: string; type?: string }>>([]);
-let { cardList, total, moreIndex, details, getKnowled, delKnowledge, openMore, onVisibleChange, getCardDetails, getfDetails } = useKnowledgeBase(kbId.value)
+let { cardList, total, moreIndex, details, getKnowled, delKnowledge, openMore, onVisibleChange: _onVisibleChange, getCardDetails, getfDetails } = useKnowledgeBase(kbId.value)
+const onVisibleChange = (visible: boolean) => {
+  _onVisibleChange(visible);
+  if (!visible) {
+    moveMenuMode.value = 'normal';
+  }
+};
 let isCardDetails = ref(false);
 let timeout: ReturnType<typeof setInterval> | null = null;
 let delDialog = ref(false)
@@ -102,6 +167,17 @@ let knowledgeIndex = ref(-1)
 let knowledgeScroll = ref()
 let page = 1;
 let pageSize = 35;
+
+// Move state — inline in card menu
+const moveMenuMode = ref<'normal' | 'targets' | 'confirm'>('normal');
+const moveKnowledgeId = ref('');
+const moveTargetKbs = ref<any[]>([]);
+const moveTargetsLoading = ref(false);
+const moveSelectedTargetId = ref('');
+const moveSelectedTargetName = ref('');
+const moveMode = ref<'reuse_vectors' | 'reparse'>('reuse_vectors');
+const moveSubmitting = ref(false);
+let movePollTimer: ReturnType<typeof setInterval> | null = null;
 
 const selectedTagId = ref<string>('');
 const tagList = ref<any[]>([]);
@@ -117,14 +193,16 @@ let docSearchDebounce: ReturnType<typeof setTimeout> | null = null;
 const docSearchKeyword = ref('');
 const selectedFileType = ref('');
 const fileTypeOptions = computed(() => [
-  { content: t('knowledgeBase.allFileTypes') || '全部类型', value: '' },
+  { content: t('knowledgeBase.allFileTypes'), value: '' },
   { content: 'PDF', value: 'pdf' },
   { content: 'DOCX', value: 'docx' },
   { content: 'DOC', value: 'doc' },
+  { content: 'PPTX', value: 'pptx' },
+  { content: 'PPT', value: 'ppt' },
   { content: 'TXT', value: 'txt' },
   { content: 'MD', value: 'md' },
   { content: 'URL', value: 'url' },
-  { content: t('knowledgeBase.typeManual') || '手动创建', value: 'manual' },
+  { content: t('knowledgeBase.typeManual'), value: 'manual' },
 ]);
 type TagInputInstance = ComponentPublicInstance<{ focus: () => void; select: () => void }>;
 const tagDropdownOptions = computed(() =>
@@ -201,7 +279,7 @@ const getKnowledgeType = (item: any) => {
     return t('knowledgeBase.typeURL') || 'URL';
   }
   if (item.type === 'manual') {
-    return t('knowledgeBase.typeManual') || '手动创建';
+    return t('knowledgeBase.typeManual');
   }
   if (item.file_type) {
     return item.file_type.toUpperCase();
@@ -426,7 +504,7 @@ const handleKnowledgeTagChange = async (knowledgeId: string, tagValue: string) =
     // Pass the tag value directly (empty string means no tag)
     const tagIdToUpdate = tagValue || null;
     await updateKnowledgeTagBatch({ updates: { [knowledgeId]: tagIdToUpdate } });
-    MessagePlugin.success(t('knowledgeBase.tagUpdateSuccess') || '分类已更新');
+    MessagePlugin.success(t('knowledgeBase.tagUpdateSuccess'));
     loadKnowledgeFiles(kbId.value);
     loadTags(kbId.value);
   } catch (error: any) {
@@ -564,24 +642,51 @@ const handleOpenURLImportDialog = (event: CustomEvent) => {
   }
 };
 
+// Auto-open document detail when navigated with ?knowledge_id=xxx
+const pendingKnowledgeId = ref<string | null>(
+  (route.query.knowledge_id as string) || null
+);
+
+const tryAutoOpenDocument = () => {
+  if (!pendingKnowledgeId.value || !cardList.value?.length) return;
+  const targetId = pendingKnowledgeId.value;
+  pendingKnowledgeId.value = null;
+  const card = cardList.value.find((c: KnowledgeCard) => c.id === targetId);
+  if (card) {
+    nextTick(() => openCardDetails(card));
+  } else {
+    nextTick(() => {
+      openCardDetails({ id: targetId } as KnowledgeCard);
+    });
+  }
+};
+
 onMounted(() => {
   loadKnowledgeBaseInfo(kbId.value);
   loadKnowledgeList();
-  // Load shared knowledge bases to get permission info
   orgStore.fetchSharedKnowledgeBases();
 
-  // 监听文件上传事件
+  getParserEngines()
+    .then(res => { parserEngines.value = res?.data || [] })
+    .catch(() => { parserEngines.value = [] })
+
   window.addEventListener('knowledgeFileUploaded', handleFileUploaded as EventListener);
-  // 监听URL导入对话框打开事件
   window.addEventListener('openURLImportDialog', handleOpenURLImportDialog as EventListener);
 });
 
 onUnmounted(() => {
   window.removeEventListener('knowledgeFileUploaded', handleFileUploaded as EventListener);
   window.removeEventListener('openURLImportDialog', handleOpenURLImportDialog as EventListener);
+  stopMovePoll();
 });
 watch(() => cardList.value, (newValue) => {
   if (isFAQ.value) return;
+
+  // Auto-open document if navigated with ?knowledge_id=xxx
+  if (pendingKnowledgeId.value && newValue?.length) {
+    tryAutoOpenDocument();
+  }
+
   let analyzeList = [];
   // Filter items that need polling: parsing in progress OR summary generation in progress
   analyzeList = newValue.filter(item => {
@@ -697,6 +802,99 @@ const delCard = (index: number, item: KnowledgeCard) => {
   delDialog.value = true;
 };
 
+const handleMoveKnowledge = async (item: KnowledgeCard) => {
+  moveKnowledgeId.value = item.id;
+  moveMenuMode.value = 'targets';
+  moveTargetsLoading.value = true;
+  moveTargetKbs.value = [];
+  try {
+    const res: any = await listMoveTargets(kbId.value);
+    moveTargetKbs.value = res.data || [];
+  } catch {
+    moveTargetKbs.value = [];
+  } finally {
+    moveTargetsLoading.value = false;
+  }
+};
+
+const handleMoveSelectTarget = (kb: any) => {
+  moveSelectedTargetId.value = kb.id;
+  moveSelectedTargetName.value = kb.name;
+  moveMode.value = 'reuse_vectors';
+  moveMenuMode.value = 'confirm';
+};
+
+const handleMoveBack = () => {
+  if (moveMenuMode.value === 'confirm') {
+    moveMenuMode.value = 'targets';
+  } else {
+    moveMenuMode.value = 'normal';
+  }
+};
+
+const handleMoveConfirm = async () => {
+  if (!moveSelectedTargetId.value || moveSubmitting.value) return;
+  moveSubmitting.value = true;
+  try {
+    const res: any = await moveKnowledge({
+      knowledge_ids: [moveKnowledgeId.value],
+      source_kb_id: kbId.value,
+      target_kb_id: moveSelectedTargetId.value,
+      mode: moveMode.value,
+    });
+    const taskId = res.data?.task_id;
+    MessagePlugin.info(t('knowledgeBase.moveStarted'));
+    // Close the card menu
+    moveMenuMode.value = 'normal';
+    cardList.value.forEach(c => { c.isMore = false; });
+
+    if (taskId) {
+      startMovePoll(taskId);
+    } else {
+      moveSubmitting.value = false;
+      loadKnowledgeFiles(kbId.value);
+    }
+  } catch (e: any) {
+    MessagePlugin.error(e?.message || t('knowledgeBase.moveFailed'));
+    moveSubmitting.value = false;
+  }
+};
+
+const startMovePoll = (taskId: string) => {
+  if (movePollTimer) clearInterval(movePollTimer);
+  movePollTimer = setInterval(async () => {
+    try {
+      const res: any = await getKnowledgeMoveProgress(taskId);
+      const data = res.data;
+      if (!data) return;
+      if (data.status === 'completed') {
+        stopMovePoll();
+        moveSubmitting.value = false;
+        const failed = data.failed || 0;
+        if (failed > 0) {
+          MessagePlugin.warning(t('knowledgeBase.moveCompletedWithErrors', { success: (data.processed || 0) - failed, failed }));
+        } else {
+          MessagePlugin.success(t('knowledgeBase.moveCompleted'));
+        }
+        loadKnowledgeFiles(kbId.value);
+      } else if (data.status === 'failed') {
+        stopMovePoll();
+        moveSubmitting.value = false;
+        MessagePlugin.error(t('knowledgeBase.moveFailed'));
+      }
+    } catch {
+      // ignore poll errors
+    }
+  }, 2000);
+};
+
+const stopMovePoll = () => {
+  if (movePollTimer) {
+    clearInterval(movePollTimer);
+    movePollTimer = null;
+  }
+};
+
 const manualEditorSuccess = ({ kbId: savedKbId }: { kbId: string; knowledgeId: string; status: 'draft' | 'publish' }) => {
   if (savedKbId === kbId.value && !isFAQ.value) {
     loadKnowledgeFiles(savedKbId);
@@ -738,7 +936,7 @@ const handleDocumentActionSelect = (data: { value: string }) => {
 
 const ensureDocumentKbReady = () => {
   if (isFAQ.value) {
-    MessagePlugin.warning('当前知识库类型不支持该操作');
+    MessagePlugin.warning(t('knowledgeBase.operationNotSupportedForType'));
     return false;
   }
   if (!kbId.value) {
@@ -775,26 +973,34 @@ const handleDocumentUpload = async (event: Event) => {
   if (!files || files.length === 0) return;
   
   if (!kbId.value) {
-    MessagePlugin.error("缺少知识库ID");
+    MessagePlugin.error(t('error.missingKbId'));
     resetUploadInput();
     return;
   }
 
-  // 过滤有效文件
+  const dynamicTypes = supportedFileTypes.value.size > 0 ? supportedFileTypes.value : undefined
   const validFiles: File[] = [];
+  let skippedCount = 0;
   for (let i = 0; i < files.length; i++) {
     const file = files[i];
-    if (!kbFileTypeVerification(file, files.length > 1)) {
+    if (!kbFileTypeVerification(file, files.length > 1, dynamicTypes)) {
       validFiles.push(file);
+    } else {
+      skippedCount++;
     }
   }
 
   if (validFiles.length === 0) {
+    if (skippedCount > 0) {
+      MessagePlugin.warning(t('knowledgeBase.allFilesSkippedNoEngine'));
+    }
     resetUploadInput();
     return;
   }
+  if (skippedCount > 0) {
+    MessagePlugin.warning(t('knowledgeBase.filesSkippedNoEngine', { count: skippedCount }));
+  }
 
-  // 批量上传
   let successCount = 0;
   let failCount = 0;
   const totalCount = validFiles.length;
@@ -810,14 +1016,14 @@ const handleDocumentUpload = async (event: Event) => {
         successCount++;
       } else {
         failCount++;
-        let errorMessage = "上传失败！";
+        let errorMessage = t('knowledgeBase.uploadFailed');
         if (responseData?.error?.message) {
           errorMessage = responseData.error.message;
         } else if (responseData?.message) {
           errorMessage = responseData.message;
         }
         if (responseData?.code === 'duplicate_file' || responseData?.error?.code === 'duplicate_file') {
-          errorMessage = "文件已存在";
+          errorMessage = t('knowledgeBase.fileExists');
         }
         if (totalCount === 1) {
           MessagePlugin.error(errorMessage);
@@ -825,7 +1031,7 @@ const handleDocumentUpload = async (event: Event) => {
       }
     } catch (error: any) {
       failCount++;
-      let errorMessage = error?.error?.message || error?.message || "上传失败！";
+      let errorMessage = error?.error?.message || error?.message || t('knowledgeBase.uploadFailed');
       if (error?.code === 'duplicate_file') {
         errorMessage = "文件已存在";
       }
@@ -844,15 +1050,15 @@ const handleDocumentUpload = async (event: Event) => {
 
   if (totalCount === 1) {
     if (successCount === 1) {
-      MessagePlugin.success("上传成功！");
+      MessagePlugin.success(t('knowledgeBase.uploadSuccess'));
     }
   } else {
     if (failCount === 0) {
-      MessagePlugin.success(`所有文件上传成功（${successCount}个）`);
+      MessagePlugin.success(t('knowledgeBase.allUploadSuccess', { count: successCount }));
     } else if (successCount > 0) {
-      MessagePlugin.warning(`部分文件上传成功（成功：${successCount}，失败：${failCount}）`);
+      MessagePlugin.warning(t('knowledgeBase.partialUploadSuccess', { success: successCount, fail: failCount }));
     } else {
-      MessagePlugin.error(`所有文件上传失败（${failCount}个）`);
+      MessagePlugin.error(t('knowledgeBase.allUploadFailed', { count: failCount }));
     }
   }
 
@@ -866,15 +1072,14 @@ const handleFolderUpload = async (event: Event) => {
   if (!files || files.length === 0) return;
 
   if (!kbId.value) {
-    MessagePlugin.error("缺少知识库ID");
+    MessagePlugin.error(t('error.missingKbId'));
     if (input) input.value = '';
     return;
   }
 
-  // 检查是否启用了VLM
   const vlmEnabled = kbInfo.value?.vlm_config?.enabled || false;
+  const dynamicTypes = supportedFileTypes.value.size > 0 ? supportedFileTypes.value : undefined
 
-  // 过滤有效文件
   const validFiles: File[] = [];
   let hiddenFileCount = 0;
   let imageFilteredCount = 0;
@@ -883,7 +1088,6 @@ const handleFolderUpload = async (event: Event) => {
     const file = files[i];
     const relativePath = (file as any).webkitRelativePath || file.name;
     
-    // 1. 过滤隐藏文件和隐藏文件夹
     const pathParts = relativePath.split('/');
     const hasHiddenComponent = pathParts.some((part: string) => part.startsWith('.'));
     if (hasHiddenComponent) {
@@ -891,7 +1095,6 @@ const handleFolderUpload = async (event: Event) => {
       continue;
     }
     
-    // 2. 如果未启用VLM，过滤图片文件
     if (!vlmEnabled) {
       const fileExt = file.name.substring(file.name.lastIndexOf('.') + 1).toLowerCase();
       const imageTypes = ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp'];
@@ -901,8 +1104,7 @@ const handleFolderUpload = async (event: Event) => {
       }
     }
     
-    // 3. 文件类型验证
-    if (!kbFileTypeVerification(file, true)) {
+    if (!kbFileTypeVerification(file, true, dynamicTypes)) {
       validFiles.push(file);
     }
   }
@@ -985,7 +1187,7 @@ const handleURLImportCancel = () => {
 const handleURLImportConfirm = async () => {
   const url = urlInputValue.value.trim();
   if (!url) {
-    MessagePlugin.warning(t('knowledgeBase.urlRequired') || '请输入URL');
+    MessagePlugin.warning(t('knowledgeBase.urlRequired'));
     return;
   }
   
@@ -993,12 +1195,12 @@ const handleURLImportConfirm = async () => {
   try {
     new URL(url);
   } catch (error) {
-    MessagePlugin.warning(t('knowledgeBase.invalidURL') || '请输入有效的URL');
+    MessagePlugin.warning(t('knowledgeBase.invalidURL'));
     return;
   }
 
   if (!kbId.value) {
-    MessagePlugin.error("缺少知识库ID");
+    MessagePlugin.error(t('error.missingKbId'));
     return;
   }
 
@@ -1012,25 +1214,25 @@ const handleURLImportConfirm = async () => {
     }));
     const isSuccess = responseData?.success || responseData?.code === 200 || responseData?.status === 'success' || (!responseData?.error && responseData);
     if (isSuccess) {
-      MessagePlugin.success(t('knowledgeBase.urlImportSuccess') || 'URL导入成功！');
+      MessagePlugin.success(t('knowledgeBase.urlImportSuccess'));
       urlDialogVisible.value = false;
       urlInputValue.value = '';
     } else {
-      let errorMessage = t('knowledgeBase.urlImportFailed') || "URL导入失败！";
+      let errorMessage = t('knowledgeBase.urlImportFailed');
       if (responseData?.error?.message) {
         errorMessage = responseData.error.message;
       } else if (responseData?.message) {
         errorMessage = responseData.message;
       }
       if (responseData?.code === 'duplicate_url' || responseData?.error?.code === 'duplicate_url') {
-        errorMessage = t('knowledgeBase.urlExists') || "该URL已存在";
+        errorMessage = t('knowledgeBase.urlExists');
       }
       MessagePlugin.error(errorMessage);
     }
   } catch (error: any) {
-    let errorMessage = error?.error?.message || error?.message || t('knowledgeBase.urlImportFailed') || "URL导入失败！";
+    let errorMessage = error?.error?.message || error?.message || t('knowledgeBase.urlImportFailed');
     if (error?.code === 'duplicate_url') {
-      errorMessage = t('knowledgeBase.urlExists') || "该URL已存在";
+      errorMessage = t('knowledgeBase.urlExists');
     }
     MessagePlugin.error(errorMessage);
   } finally {
@@ -1082,6 +1284,33 @@ const handleManualEdit = (index: number, item: KnowledgeCard) => {
   });
 };
 
+const handleKnowledgeReparse = async (index: number, item: KnowledgeCard) => {
+  if (isFAQ.value) return;
+  if (!canEdit.value) return;
+  if (!item?.id) {
+    MessagePlugin.warning(t('knowledgeEditor.messages.missingId'));
+    return;
+  }
+  if (item.parse_status === 'pending' || item.parse_status === 'processing') {
+    MessagePlugin.info(t('knowledgeBase.rebuildInProgress'));
+    return;
+  }
+  if (cardList.value[index]) {
+    cardList.value[index].isMore = false;
+  }
+  const confirm = window.confirm(
+    t('knowledgeBase.rebuildConfirm', { fileName: item.file_name || item.title || '' }) as string,
+  );
+  if (!confirm) return;
+  try {
+    await reparseKnowledge(item.id);
+    MessagePlugin.success(t('knowledgeBase.rebuildSubmitted'));
+    loadKnowledgeFiles(kbId.value);
+  } catch (error: any) {
+    MessagePlugin.error(error?.message || t('knowledgeBase.rebuildFailed'));
+  }
+};
+
 const handleScroll = () => {
   if (isFAQ.value) return;
   const element = knowledgeScroll.value;
@@ -1111,9 +1340,8 @@ const delCardConfirm = () => {
 
 // 处理知识库编辑成功后的回调
 const handleKBEditorSuccess = (kbIdValue: string) => {
-  // 如果编辑的是当前知识库，刷新文件列表
   if (kbIdValue === kbId.value) {
-    loadKnowledgeFiles(kbIdValue);
+    loadKnowledgeBaseInfo(kbIdValue);
   }
 };
 
@@ -1226,6 +1454,11 @@ async function createNewSession(value: string): Promise<void> {
             </t-tooltip>
           </div>
           <p class="document-subtitle">{{ $t('knowledgeEditor.document.subtitle') }}</p>
+          <p v-if="unsupportedFileTypes.length" class="parser-hint" @click="goToParserSettings">
+            <t-icon name="info-circle" class="parser-hint-icon" />
+            <span>{{ $t('knowledgeBase.unsupportedTypesHint', { types: unsupportedFileTypes.map(t => '.' + t).join('、') }) }}</span>
+            <span class="parser-hint-link">{{ $t('knowledgeBase.goToParserSettings') }} →</span>
+          </p>
         </div>
       </div>
       
@@ -1233,7 +1466,7 @@ async function createNewSession(value: string): Promise<void> {
         ref="uploadInputRef"
         type="file"
         class="document-upload-input"
-        accept=".pdf,.docx,.doc,.txt,.md,.jpg,.jpeg,.png,.csv,.xlsx,.xls"
+        :accept="acceptFileTypes || '.pdf,.docx,.doc,.txt,.md,.jpg,.jpeg,.png,.csv,.xlsx,.xls,.pptx,.ppt'"
         multiple
         @change="handleDocumentUpload"
       />
@@ -1484,7 +1717,8 @@ async function createNewSession(value: string): Promise<void> {
                             <img class="more" src="@/assets/img/more.png" alt="" />
                           </div>
                           <template #content>
-                            <div class="card-menu">
+                            <!-- Normal menu -->
+                            <div v-if="moveMenuMode === 'normal'" class="card-menu">
                               <div
                                 v-if="item.type === 'manual'"
                                 class="card-menu-item"
@@ -1493,9 +1727,83 @@ async function createNewSession(value: string): Promise<void> {
                                 <t-icon class="icon" name="edit" />
                                 <span>{{ t('knowledgeBase.editDocument') }}</span>
                               </div>
+                              <div class="card-menu-item" @click.stop="handleKnowledgeReparse(index, item)">
+                                <t-icon class="icon" name="refresh" />
+                                <span>{{ t('knowledgeBase.rebuildDocument') }}</span>
+                              </div>
+                              <div class="card-menu-item" @click.stop="handleMoveKnowledge(item)">
+                                <t-icon class="icon" name="swap" />
+                                <span>{{ t('knowledgeBase.moveDocument') }}</span>
+                              </div>
                               <div class="card-menu-item danger" @click.stop="delCard(index, item)">
                                 <t-icon class="icon" name="delete" />
                                 <span>{{ t('knowledgeBase.deleteDocument') }}</span>
+                              </div>
+                            </div>
+
+                            <!-- Move: target KB list -->
+                            <div v-else-if="moveMenuMode === 'targets'" class="card-menu move-menu">
+                              <div class="move-menu-header" @click.stop="handleMoveBack">
+                                <t-icon name="chevron-left" size="16px" />
+                                <span>{{ t('knowledgeBase.moveToKnowledgeBase') }}</span>
+                              </div>
+                              <div v-if="moveTargetsLoading" class="move-menu-loading">
+                                <t-loading size="small" />
+                              </div>
+                              <div v-else-if="moveTargetKbs.length === 0" class="move-menu-empty">
+                                {{ t('knowledgeBase.moveNoTargets') }}
+                              </div>
+                              <template v-else>
+                                <div
+                                  v-for="kb in moveTargetKbs"
+                                  :key="kb.id"
+                                  class="card-menu-item"
+                                  @click.stop="handleMoveSelectTarget(kb)"
+                                >
+                                  <t-icon class="icon" name="root-list" />
+                                  <span class="move-target-name">{{ kb.name }}</span>
+                                  <span v-if="kb.knowledge_count !== undefined" class="move-target-count">{{ kb.knowledge_count }}</span>
+                                </div>
+                              </template>
+                            </div>
+
+                            <!-- Move: confirm with mode selection -->
+                            <div v-else-if="moveMenuMode === 'confirm'" class="card-menu move-menu">
+                              <div class="move-menu-header" @click.stop="handleMoveBack">
+                                <t-icon name="chevron-left" size="16px" />
+                                <span>{{ t('knowledgeBase.moveConfirmTitle') }}</span>
+                              </div>
+                              <div class="move-confirm-body">
+                                <div class="move-target-info">
+                                  <t-icon name="arrow-right" size="14px" />
+                                  <span>{{ moveSelectedTargetName }}</span>
+                                </div>
+                                <div
+                                  class="move-mode-item"
+                                  :class="{ active: moveMode === 'reuse_vectors' }"
+                                  @click.stop="moveMode = 'reuse_vectors'"
+                                >
+                                  <t-radio :checked="moveMode === 'reuse_vectors'" />
+                                  <div class="move-mode-text">
+                                    <span class="move-mode-label">{{ t('knowledgeBase.moveModeReuseVectors') }}</span>
+                                    <span class="move-mode-desc">{{ t('knowledgeBase.moveModeReuseVectorsDesc') }}</span>
+                                  </div>
+                                </div>
+                                <div
+                                  class="move-mode-item"
+                                  :class="{ active: moveMode === 'reparse' }"
+                                  @click.stop="moveMode = 'reparse'"
+                                >
+                                  <t-radio :checked="moveMode === 'reparse'" />
+                                  <div class="move-mode-text">
+                                    <span class="move-mode-label">{{ t('knowledgeBase.moveModeReparse') }}</span>
+                                    <span class="move-mode-desc">{{ t('knowledgeBase.moveModeReparseDesc') }}</span>
+                                  </div>
+                                </div>
+                                <div class="move-confirm-actions">
+                                  <t-button size="small" variant="outline" @click.stop="handleMoveBack">{{ t('common.cancel') }}</t-button>
+                                  <t-button size="small" theme="primary" :loading="moveSubmitting" @click.stop="handleMoveConfirm">{{ t('knowledgeBase.moveConfirm') }}</t-button>
+                                </div>
                               </div>
                             </div>
                           </template>
@@ -1578,7 +1886,7 @@ async function createNewSession(value: string): Promise<void> {
                         </div>
                         <div class="card-popover-extra">
                           <span v-if="(hoveredCardItem as any).created_at" class="card-popover-created">
-                            {{ t('knowledgeBase.createdAt') || '创建' }}：{{ formatDocTime((hoveredCardItem as any).created_at) }}
+                            {{ t('knowledgeBase.createdAt') }}：{{ formatDocTime((hoveredCardItem as any).created_at) }}
                           </span>
                           <span v-if="formatFileSize((hoveredCardItem as any).file_size)" class="card-popover-size">
                             {{ formatFileSize((hoveredCardItem as any).file_size) }}
@@ -1586,11 +1894,11 @@ async function createNewSession(value: string): Promise<void> {
                         </div>
                       </template>
                       <div class="card-popover-meta">
-                        <span class="card-popover-time">{{ t('knowledgeBase.updatedAt') || '更新' }}：{{ formatDocTime(hoveredCardItem.updated_at) }}</span>
+                        <span class="card-popover-time">{{ t('knowledgeBase.updatedAt') }}：{{ formatDocTime(hoveredCardItem.updated_at) }}</span>
                         <span v-if="getTagName(hoveredCardItem.tag_id)" class="card-popover-tag">{{ getTagName(hoveredCardItem.tag_id) }}</span>
                         <span class="card-popover-type">{{ getKnowledgeType(hoveredCardItem) }}</span>
                       </div>
-                      <div class="card-popover-hint">{{ t('knowledgeBase.clickToViewFull') || '点击卡片查看全文与分段' }}</div>
+                      <div class="card-popover-hint">{{ t('knowledgeBase.clickToViewFull') }}</div>
                     </template>
                   </div>
                 </Teleport>
@@ -1625,31 +1933,31 @@ async function createNewSession(value: string): Promise<void> {
               </div>
             </div>
           </t-dialog>
-          
+
           <!-- URL 导入对话框 -->
           <t-dialog
             v-model:visible="urlDialogVisible"
-            :header="$t('knowledgeBase.importURLTitle') || '导入网页'"
+            :header="$t('knowledgeBase.importURLTitle')"
             :confirm-btn="{
-              content: $t('common.confirm') || '确认',
+              content: $t('common.confirm'),
               theme: 'primary',
               loading: urlImporting,
             }"
-            :cancel-btn="{ content: $t('common.cancel') || '取消' }"
+            :cancel-btn="{ content: $t('common.cancel') }"
             @confirm="handleURLImportConfirm"
             @cancel="handleURLImportCancel"
             width="500px"
           >
             <div class="url-import-form">
-              <div class="url-input-label">{{ $t('knowledgeBase.urlLabel') || 'URL地址' }}</div>
+              <div class="url-input-label">{{ $t('knowledgeBase.urlLabel') }}</div>
               <t-input
                 v-model="urlInputValue"
-                :placeholder="$t('knowledgeBase.urlPlaceholder') || '请输入网页URL，例如：https://example.com'"
+                :placeholder="$t('knowledgeBase.urlPlaceholder')"
                 clearable
                 autofocus
                 @keydown.enter="handleURLImportConfirm"
               />
-              <div class="url-input-tip">{{ $t('knowledgeBase.urlTip') || '支持导入各类网页内容，系统会自动提取和解析网页中的文本内容' }}</div>
+              <div class="url-input-tip">{{ $t('knowledgeBase.urlTip') }}</div>
             </div>
           </t-dialog>
           
@@ -1680,10 +1988,11 @@ async function createNewSession(value: string): Promise<void> {
 }
 
 .card-more .t-popup__content {
-  width: 180px;
+  min-width: 180px;
+  width: auto;
   padding: 6px 0;
   margin-top: 4px !important;
-  color: #000000e6;
+  color: var(--td-text-color-primary);
 }
 .card-more .t-popup__content:hover {
   color: inherit !important;
@@ -1702,8 +2011,8 @@ async function createNewSession(value: string): Promise<void> {
 /* 面包屑下拉菜单优化 */
 .t-popup__content {
   .t-dropdown__menu {
-    background: #ffffff;
-    border: 1px solid #e7e9eb;
+    background: var(--td-bg-color-container);
+    border: 1px solid var(--td-component-stroke);
     border-radius: 10px;
     box-shadow: 0 6px 28px rgba(15, 23, 42, 0.08);
     padding: 6px;
@@ -1717,7 +2026,7 @@ async function createNewSession(value: string): Promise<void> {
     margin: 2px 0;
     transition: all 0.12s ease;
     font-size: 13px;
-    color: #0f172a;
+    color: var(--td-text-color-primary);
     cursor: pointer;
     min-width: auto !important;
     max-width: 100% !important;
@@ -1726,8 +2035,8 @@ async function createNewSession(value: string): Promise<void> {
     width: 100%;
 
     &:hover {
-      background: #f6f8f7;
-      color: #10b981;
+      background: var(--td-bg-color-container);
+      color: var(--td-success-color);
     }
 
     .t-dropdown__item-icon {
@@ -1775,8 +2084,8 @@ async function createNewSession(value: string): Promise<void> {
   display: flex;
   flex: 1;
   min-height: 0;
-  background: #fafbfc;
-  border: 1px solid #e7ebf0;
+  background: var(--td-bg-color-container);
+  border: 1px solid var(--td-component-stroke);
   border-radius: 10px;
   overflow: hidden;
 }
@@ -1784,8 +2093,8 @@ async function createNewSession(value: string): Promise<void> {
 // 与列表页筛选区一致：白底卡片感、细分界
 .tag-sidebar {
   width: 200px;
-  background: #fff;
-  border-right: 1px solid #e7ebf0;
+  background: var(--td-bg-color-container);
+  border-right: 1px solid var(--td-component-stroke);
   box-shadow: 2px 0 8px rgba(0, 0, 0, 0.04);
   padding: 16px;
   display: flex;
@@ -1799,7 +2108,7 @@ async function createNewSession(value: string): Promise<void> {
     align-items: center;
     justify-content: space-between;
     margin-bottom: 10px;
-    color: #1d2129;
+    color: var(--td-text-color-primary);
 
     .sidebar-title {
       display: flex;
@@ -1810,14 +2119,14 @@ async function createNewSession(value: string): Promise<void> {
 
       .sidebar-count {
         font-size: 12px;
-        color: #86909c;
+        color: var(--td-text-color-secondary);
       }
     }
 
     .sidebar-actions {
       display: flex;
       gap: 6px;
-      color: #c9ced6;
+      color: var(--td-text-color-placeholder);
       align-items: center;
 
       .create-tag-btn {
@@ -1830,13 +2139,13 @@ async function createNewSession(value: string): Promise<void> {
         justify-content: center;
         font-size: 16px;
         font-weight: 600;
-        color: #00a870;
+        color: var(--td-success-color);
         line-height: 1;
         transition: background 0.2s ease, color 0.2s ease;
 
         &:hover {
-          background: #f3f5f7;
-          color: #05a04f;
+          background: var(--td-bg-color-secondarycontainer);
+          color: var(--td-brand-color-active);
         }
       }
 
@@ -1851,8 +2160,8 @@ async function createNewSession(value: string): Promise<void> {
 
     :deep(.t-input) {
       font-size: 13px;
-      background-color: #f7f9fc;
-      border-color: #e5e9f2;
+      background-color: var(--td-bg-color-container);
+      border-color: var(--td-component-stroke);
       border-radius: 6px;
     }
   }
@@ -1879,7 +2188,7 @@ async function createNewSession(value: string): Promise<void> {
       :deep(.t-button) {
         padding: 0;
         font-size: 12px;
-        color: #00a870;
+        color: var(--td-success-color);
       }
     }
 
@@ -1889,7 +2198,7 @@ async function createNewSession(value: string): Promise<void> {
       justify-content: space-between;
       padding: 9px 12px;
       border-radius: 6px;
-      color: #2d3139;
+      color: var(--td-text-color-primary);
       cursor: pointer;
       transition: all 0.2s ease;
       font-family: "PingFang SC", -apple-system, BlinkMacSystemFont, sans-serif;
@@ -1905,7 +2214,7 @@ async function createNewSession(value: string): Promise<void> {
 
         .t-icon {
           flex-shrink: 0;
-          color: #5c6470;
+          color: var(--td-text-color-secondary);
           font-size: 14px;
           transition: color 0.2s ease;
         }
@@ -1934,38 +2243,38 @@ async function createNewSession(value: string): Promise<void> {
 
       .tag-count {
         font-size: 12px;
-        color: #5c6470;
+        color: var(--td-text-color-secondary);
         font-weight: 500;
         min-width: 28px;
         padding: 3px 7px;
         border-radius: 8px;
-        background: #eef0f3;
+        background: var(--td-bg-color-secondarycontainer);
         transition: all 0.2s ease;
         text-align: center;
         box-sizing: border-box;
       }
 
       &:hover {
-        background: #f2f4f7;
-        color: #1d2129;
+        background: var(--td-bg-color-secondarycontainer);
+        color: var(--td-text-color-primary);
 
         .tag-list-left .t-icon {
-          color: #1d2129;
+          color: var(--td-text-color-primary);
         }
 
         .tag-count {
-          background: #e5e9f2;
-          color: #1d2129;
+          background: var(--td-bg-color-secondarycontainer);
+          color: var(--td-text-color-primary);
         }
       }
 
       &.active {
-        background: #e6f7ec;
-        color: #07c05f;
+        background: var(--td-success-color-light);
+        color: var(--td-brand-color);
         font-weight: 500;
 
         .tag-list-left .t-icon {
-          color: #07c05f;
+          color: var(--td-brand-color);
         }
 
         .tag-name {
@@ -1973,8 +2282,8 @@ async function createNewSession(value: string): Promise<void> {
         }
 
         .tag-count {
-          background: #b8f0d3;
-          color: #07c05f;
+          background: var(--td-success-color-light);
+          color: var(--td-brand-color);
           font-weight: 600;
         }
       }
@@ -2019,22 +2328,22 @@ async function createNewSession(value: string): Promise<void> {
         }
 
         :deep(.tag-action-btn.confirm) {
-          background: #eefcf5;
-          color: #059669;
+          background: var(--td-success-color-light);
+          color: var(--td-brand-color-active);
 
           &:hover {
-            background: #d9f7e9;
-            color: #047857;
+            background: var(--td-success-color-light);
+            color: var(--td-success-color);
           }
         }
 
         :deep(.tag-action-btn.cancel) {
-          background: #f9fafb;
-          color: #6b7280;
+          background: var(--td-bg-color-secondarycontainer);
+          color: var(--td-text-color-secondary);
 
           &:hover {
-            background: #f3f4f6;
-            color: #4b5563;
+            background: var(--td-bg-color-secondarycontainer);
+            color: var(--td-text-color-secondary);
           }
         }
       }
@@ -2048,7 +2357,7 @@ async function createNewSession(value: string): Promise<void> {
           font-size: 12px;
           background-color: transparent;
           border: none;
-          border-bottom: 1px solid #d0d5dd;
+          border-bottom: 1px solid var(--td-component-stroke);
           border-radius: 0;
           box-shadow: none;
           padding-left: 0;
@@ -2058,7 +2367,7 @@ async function createNewSession(value: string): Promise<void> {
         :deep(.t-input__wrap) {
           background-color: transparent;
           border: none;
-          border-bottom: 1px solid #d0d5dd;
+          border-bottom: 1px solid var(--td-component-stroke);
           border-radius: 0;
           box-shadow: none;
         }
@@ -2066,15 +2375,15 @@ async function createNewSession(value: string): Promise<void> {
         :deep(.t-input__inner) {
           padding-left: 0;
           padding-right: 0;
-          color: #1d2129;
-          caret-color: #1d2129;
+          color: var(--td-text-color-primary);
+          caret-color: var(--td-text-color-primary);
         }
 
         :deep(.t-input:hover),
         :deep(.t-input.t-is-focused),
         :deep(.t-input__wrap:hover),
         :deep(.t-input__wrap.t-is-focused) {
-          border-bottom-color: #00a870;
+          border-bottom-color: var(--td-success-color);
         }
       }
 
@@ -2096,12 +2405,12 @@ async function createNewSession(value: string): Promise<void> {
         align-items: center;
         justify-content: center;
         border-radius: 4px;
-        color: #86909c;
+        color: var(--td-text-color-secondary);
         transition: all 0.2s ease;
 
         &:hover {
-          background: #f3f5f7;
-          color: #4e5969;
+          background: var(--td-bg-color-secondarycontainer);
+          color: var(--td-text-color-secondary);
         }
       }
     }
@@ -2109,7 +2418,7 @@ async function createNewSession(value: string): Promise<void> {
     .tag-empty-state {
       text-align: center;
       padding: 10px 6px;
-      color: #a1a7b3;
+      color: var(--td-text-color-placeholder);
       font-size: 11px;
     }
   }
@@ -2126,7 +2435,7 @@ async function createNewSession(value: string): Promise<void> {
   padding: 8px 16px;
   cursor: pointer;
   transition: all 0.2s ease;
-  color: #000000e6;
+  color: var(--td-text-color-primary);
   font-family: 'PingFang SC';
   font-size: 14px;
   font-weight: 400;
@@ -2137,19 +2446,19 @@ async function createNewSession(value: string): Promise<void> {
   }
 
   &:hover {
-    background: #f5f5f5;
-    color: #000000e6;
+    background: var(--td-bg-color-secondarycontainer);
+    color: var(--td-text-color-primary);
   }
 
   &.danger {
-    color: #000000e6;
+    color: var(--td-text-color-primary);
 
     &:hover {
-      background: #fff1f0;
-      color: #fa5151;
+      background: var(--td-error-color-light);
+      color: var(--td-error-color);
 
       .menu-icon {
-        color: #fa5151;
+        color: var(--td-error-color);
       }
     }
   }
@@ -2163,7 +2472,7 @@ async function createNewSession(value: string): Promise<void> {
   min-height: 0;
   padding: 12px;
   overflow: hidden;
-  background: #fafbfc;
+  background: var(--td-bg-color-container);
 }
 
 .doc-card-area {
@@ -2193,41 +2502,41 @@ async function createNewSession(value: string): Promise<void> {
   .doc-filter-actions {
     flex-shrink: 0;
     :deep(.content-bar-icon-btn) {
-      color: #86909c;
+      color: var(--td-text-color-secondary);
       background: transparent;
       border: none;
       &:hover {
-        color: #4e5969;
-        background: #f2f3f5;
+        color: var(--td-brand-color);
+        background: var(--td-bg-color-secondarycontainer);
       }
     }
   }
 
   :deep(.t-input) {
     font-size: 13px;
-    background-color: #f7f9fc;
-    border-color: #e5e9f2;
+    background-color: var(--td-bg-color-container);
+    border-color: var(--td-component-stroke);
     border-radius: 6px;
 
     &:hover,
     &:focus,
     &.t-is-focused {
-      border-color: #4080ff;
-      background-color: #fff;
+      border-color: var(--td-brand-color);
+      background-color: var(--td-bg-color-container);
     }
   }
 
   :deep(.t-select) {
     .t-input {
       font-size: 13px;
-      background-color: #f7f9fc;
-      border-color: #e5e9f2;
+      background-color: var(--td-bg-color-container);
+      border-color: var(--td-component-stroke);
       border-radius: 6px;
 
       &:hover,
       &.t-is-focused {
-        border-color: #4080ff;
-        background-color: #fff;
+        border-color: var(--td-brand-color);
+        background-color: var(--td-bg-color-container);
       }
     }
   }
@@ -2280,7 +2589,7 @@ async function createNewSession(value: string): Promise<void> {
     align-items: center;
     gap: 6px;
     font-size: 12px;
-    color: #86909c;
+    color: var(--td-text-color-secondary);
     cursor: default;
   }
 
@@ -2289,7 +2598,7 @@ async function createNewSession(value: string): Promise<void> {
   }
 
   .kb-access-meta-sep {
-    color: #c9ced6;
+    color: var(--td-text-color-placeholder);
     user-select: none;
   }
 
@@ -2304,7 +2613,7 @@ async function createNewSession(value: string): Promise<void> {
     margin: 0;
     font-size: 20px;
     font-weight: 600;
-    color: #1d2129;
+    color: var(--td-text-color-primary);
   }
 
   .breadcrumb-link {
@@ -2313,7 +2622,7 @@ async function createNewSession(value: string): Promise<void> {
     padding: 4px 8px;
     margin: -4px -8px;
     font: inherit;
-    color: #4e5969;
+    color: var(--td-text-color-secondary);
     cursor: pointer;
     display: inline-flex;
     align-items: center;
@@ -2322,13 +2631,13 @@ async function createNewSession(value: string): Promise<void> {
     transition: all 0.12s ease;
 
     &:hover:not(:disabled) {
-      color: #10b981;
-      background: #f6f8f7;
+      color: var(--td-success-color);
+      background: var(--td-bg-color-container);
     }
 
     &:disabled {
       cursor: not-allowed;
-      color: #c9ced6;
+      color: var(--td-text-color-placeholder);
     }
 
     &.dropdown {
@@ -2349,17 +2658,17 @@ async function createNewSession(value: string): Promise<void> {
 
   .breadcrumb-separator {
     font-size: 14px;
-    color: #c9ced6;
+    color: var(--td-text-color-placeholder);
   }
 
   .breadcrumb-current {
-    color: #1d2129;
+    color: var(--td-text-color-primary);
     font-weight: 600;
   }
 
   h2 {
     margin: 0;
-    color: #000000e6;
+    color: var(--td-text-color-primary);
     font-family: "PingFang SC";
     font-size: 24px;
     font-weight: 600;
@@ -2368,13 +2677,43 @@ async function createNewSession(value: string): Promise<void> {
 
   .document-subtitle {
     margin: 0;
-    color: #00000099;
+    color: var(--td-text-color-placeholder);
     font-family: "PingFang SC";
     font-size: 14px;
     font-weight: 400;
     line-height: 20px;
   }
 
+  .parser-hint {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    margin: 2px 0 0;
+    color: var(--td-warning-color);
+    font-size: 12px;
+    line-height: 1.4;
+    cursor: pointer;
+    transition: color 0.15s ease;
+
+    &:hover {
+      color: var(--td-warning-color-active);
+
+      .parser-hint-link {
+        text-decoration: underline;
+      }
+    }
+
+    .parser-hint-icon {
+      font-size: 12px;
+      flex-shrink: 0;
+    }
+
+    .parser-hint-link {
+      color: var(--td-brand-color);
+      margin-left: 2px;
+      white-space: nowrap;
+    }
+  }
 }
 
 
@@ -2387,18 +2726,18 @@ async function createNewSession(value: string): Promise<void> {
   height: 30px;
   border: none;
   border-radius: 50%;
-  background: #f5f6f8;
+  background: var(--td-bg-color-secondarycontainer);
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  color: #6b7280;
+  color: var(--td-text-color-secondary);
   cursor: pointer;
   transition: all 0.2s ease;
   padding: 0;
 
   &:hover:not(:disabled) {
-    background: #e6f7ec;
-    color: #07c05f;
+    background: var(--td-success-color-light);
+    color: var(--td-brand-color);
     box-shadow: none;
   }
 
@@ -2418,7 +2757,7 @@ async function createNewSession(value: string): Promise<void> {
   gap: 16px;
 
   .tag-filter-label {
-    color: #00000099;
+    color: var(--td-text-color-placeholder);
     font-size: 14px;
   }
 }
@@ -2431,16 +2770,16 @@ async function createNewSession(value: string): Promise<void> {
     cursor: pointer;
     max-width: 160px;
     border-radius: 999px;
-    border-color: #e5e7eb;
-    color: #374151;
+    border-color: var(--td-component-stroke);
+    color: var(--td-text-color-primary);
     padding: 0 10px;
-    background: #f9fafb;
+    background: var(--td-bg-color-secondarycontainer);
     transition: all 0.2s ease;
 
     &:hover {
-      border-color: #07c05f;
-      color: #059669;
-      background: #ecfdf5;
+      border-color: var(--td-brand-color);
+      color: var(--td-brand-color-active);
+      background: var(--td-success-color-light);
     }
   }
 
@@ -2563,7 +2902,7 @@ async function createNewSession(value: string): Promise<void> {
   }
 
   .circle-title {
-    color: #000000e6;
+    color: var(--td-text-color-primary);
     font-family: "PingFang SC";
     font-size: 16px;
     font-weight: 600;
@@ -2571,7 +2910,7 @@ async function createNewSession(value: string): Promise<void> {
   }
 
   .del-circle-txt {
-    color: #00000099;
+    color: var(--td-text-color-placeholder);
     font-family: "PingFang SC";
     font-size: 14px;
     font-weight: 400;
@@ -2589,7 +2928,7 @@ async function createNewSession(value: string): Promise<void> {
   }
 
   .circle-btn-txt {
-    color: #000000e6;
+    color: var(--td-text-color-primary);
     font-family: "PingFang SC";
     font-size: 14px;
     font-weight: 400;
@@ -2598,7 +2937,7 @@ async function createNewSession(value: string): Promise<void> {
   }
 
   .confirm {
-    color: #FA5151;
+    color: var(--td-error-color);
     margin-left: 40px;
   }
 }
@@ -2615,10 +2954,10 @@ async function createNewSession(value: string): Promise<void> {
   gap: 8px;
   padding: 8px 12px;
   cursor: pointer;
-  color: #000000e6;
+  color: var(--td-text-color-primary);
 
   &:hover {
-    background: #f5f5f5;
+    background: var(--td-bg-color-secondarycontainer);
   }
 
   .icon {
@@ -2626,7 +2965,116 @@ async function createNewSession(value: string): Promise<void> {
   }
 
   &.danger {
-    color: #fa5151;
+    color: var(--td-error-color);
+  }
+}
+
+.move-menu {
+  min-width: 220px;
+  max-width: 280px;
+  max-height: 360px;
+  overflow-y: auto;
+
+  .move-menu-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 12px;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--td-text-color-primary);
+    border-bottom: 1px solid var(--td-component-stroke);
+    cursor: pointer;
+
+    &:hover {
+      background: var(--td-bg-color-container-hover);
+    }
+  }
+
+  .move-menu-loading {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px 0;
+  }
+
+  .move-menu-empty {
+    padding: 12px 16px;
+    font-size: 12px;
+    color: var(--td-text-color-placeholder);
+    text-align: center;
+    line-height: 1.5;
+  }
+
+  .move-target-name {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .move-target-count {
+    font-size: 12px;
+    color: var(--td-text-color-placeholder);
+  }
+
+  .move-confirm-body {
+    padding: 8px;
+
+    .move-target-info {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 8px;
+      background: var(--td-bg-color-container-hover);
+      border-radius: 6px;
+      font-size: 13px;
+      color: var(--td-text-color-secondary);
+      margin-bottom: 8px;
+    }
+
+    .move-mode-item {
+      display: flex;
+      align-items: flex-start;
+      gap: 6px;
+      padding: 6px 8px;
+      border-radius: 6px;
+      cursor: pointer;
+      margin-bottom: 4px;
+
+      &:hover {
+        background: var(--td-bg-color-container-hover);
+      }
+
+      &.active {
+        background: var(--td-brand-color-light);
+      }
+
+      .move-mode-text {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+
+        .move-mode-label {
+          font-size: 13px;
+          font-weight: 500;
+          color: var(--td-text-color-primary);
+        }
+
+        .move-mode-desc {
+          font-size: 11px;
+          color: var(--td-text-color-placeholder);
+          line-height: 1.4;
+        }
+      }
+    }
+
+    .move-confirm-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+      margin-top: 8px;
+    }
   }
 }
 
@@ -2638,19 +3086,19 @@ async function createNewSession(value: string): Promise<void> {
 }
 
 .card-draft-tip {
-  color: #b05b00;
+  color: var(--td-warning-color);
   font-size: 11px;
 }
 
 .knowledge-card {
   min-width: 248px;
-  border: 1px solid #e7e9eb;
+  border: 1px solid var(--td-component-stroke);
   height: 148px;
   border-radius: 9px;
   overflow: hidden;
   box-sizing: border-box;
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
-  background: #fff;
+  background: var(--td-bg-color-container);
   position: relative;
   cursor: pointer;
   transition: border-color 0.2s ease, box-shadow 0.2s ease;
@@ -2666,20 +3114,20 @@ async function createNewSession(value: string): Promise<void> {
 
   .card-analyze-loading {
     display: block;
-    color: #07c05f;
+    color: var(--td-brand-color);
     font-size: 14px;
     margin-top: 2px;
   }
 
   .card-analyze-txt {
-    color: #07c05f;
+    color: var(--td-brand-color);
     font-family: "PingFang SC";
     font-size: 11px;
     margin-left: 8px;
   }
 
   .failure {
-    color: #fa5151;
+    color: var(--td-error-color);
   }
 
   .card-content-nav {
@@ -2699,7 +3147,7 @@ async function createNewSession(value: string): Promise<void> {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    color: #1d2129;
+    color: var(--td-text-color-primary);
     font-family: "PingFang SC", -apple-system, sans-serif;
     font-size: 15px;
     font-weight: 600;
@@ -2718,7 +3166,7 @@ async function createNewSession(value: string): Promise<void> {
   }
 
   .more-wrap:hover {
-    background: #e7e7e7;
+    background: var(--td-component-stroke);
   }
 
   .more {
@@ -2727,7 +3175,7 @@ async function createNewSession(value: string): Promise<void> {
   }
 
   .active-more {
-    background: #e7e7e7;
+    background: var(--td-component-stroke);
   }
 
   .card-content-txt {
@@ -2736,7 +3184,7 @@ async function createNewSession(value: string): Promise<void> {
     -webkit-line-clamp: 2;
     line-clamp: 2;
     overflow: hidden;
-    color: #86909c;
+    color: var(--td-text-color-secondary);
     font-family: "PingFang SC";
     font-size: 12px;
     font-weight: 400;
@@ -2753,30 +3201,30 @@ async function createNewSession(value: string): Promise<void> {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    background: linear-gradient(to top, #f7f8fa 0%, #fafbfc 100%);
-    border-top: 1px solid #f0f1f3;
+    background: var(--td-bg-color-container);
+    border-top: 1px solid var(--td-component-stroke);
   }
 
   .card-time {
-    color: #86909c;
+    color: var(--td-text-color-secondary);
     font-family: "PingFang SC";
     font-size: 12px;
     font-weight: 400;
   }
 
   .card-type {
-    color: #4e5969;
+    color: var(--td-text-color-secondary);
     font-family: "PingFang SC";
     font-size: 11px;
     font-weight: 500;
     padding: 3px 8px;
-    background: #e8e9eb;
+    background: var(--td-bg-color-secondarycontainer);
     border-radius: 4px;
   }
 }
 
 .knowledge-card:hover {
-  border-color: #07c05f;
+  border-color: var(--td-brand-color);
   box-shadow: 0 2px 8px rgba(7, 192, 95, 0.12);
 }
 
@@ -2788,8 +3236,8 @@ async function createNewSession(value: string): Promise<void> {
   min-width: 220px;
   max-width: 360px;
   padding: 12px 14px;
-  background: #fff;
-  border: 1px solid #e7ebf0;
+  background: var(--td-bg-color-container);
+  border: 1px solid var(--td-component-stroke);
   border-radius: 8px;
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
   font-family: "PingFang SC", -apple-system, sans-serif;
@@ -2798,7 +3246,7 @@ async function createNewSession(value: string): Promise<void> {
   .card-popover-title {
     font-size: 14px;
     font-weight: 600;
-    color: #1d2129;
+    color: var(--td-text-color-primary);
     margin-bottom: 8px;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -2813,21 +3261,21 @@ async function createNewSession(value: string): Promise<void> {
     gap: 6px;
 
     &.parsing {
-      color: #07c05f;
+      color: var(--td-brand-color);
     }
 
     &.failure {
-      color: #fa5151;
+      color: var(--td-error-color);
     }
 
     &.draft {
-      color: #b05b00;
+      color: var(--td-warning-color);
     }
   }
 
   .card-popover-desc {
     font-size: 12px;
-    color: #4e5969;
+    color: var(--td-text-color-secondary);
     line-height: 1.5;
     margin-bottom: 8px;
     display: -webkit-box;
@@ -2841,7 +3289,7 @@ async function createNewSession(value: string): Promise<void> {
     display: block;
     margin-top: 4px;
     font-size: 11px;
-    color: #fa5151;
+    color: var(--td-error-color);
     opacity: 0.95;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -2851,7 +3299,7 @@ async function createNewSession(value: string): Promise<void> {
 
   .card-popover-source {
     font-size: 11px;
-    color: #0052d9;
+    color: var(--td-brand-color);
     margin-bottom: 6px;
     display: flex;
     align-items: center;
@@ -2868,7 +3316,7 @@ async function createNewSession(value: string): Promise<void> {
     flex-wrap: wrap;
     gap: 10px;
     font-size: 11px;
-    color: #86909c;
+    color: var(--td-text-color-secondary);
     margin-bottom: 6px;
   }
 
@@ -2883,29 +3331,29 @@ async function createNewSession(value: string): Promise<void> {
     flex-wrap: wrap;
     gap: 8px;
     font-size: 11px;
-    color: #86909c;
+    color: var(--td-text-color-secondary);
   }
 
   .card-popover-tag {
     padding: 1px 6px;
-    background: #e6f7ec;
-    color: #07c05f;
+    background: var(--td-success-color-light);
+    color: var(--td-brand-color);
     border-radius: 4px;
   }
 
   .card-popover-type {
     padding: 1px 6px;
-    background: #e8e9eb;
-    color: #4e5969;
+    background: var(--td-bg-color-secondarycontainer);
+    color: var(--td-text-color-secondary);
     border-radius: 4px;
   }
 
   .card-popover-hint {
     margin-top: 8px;
     padding-top: 8px;
-    border-top: 1px solid #f0f1f3;
+    border-top: 1px solid var(--td-component-stroke);
     font-size: 11px;
-    color: #86909c;
+    color: var(--td-text-color-secondary);
   }
 }
 
@@ -2913,14 +3361,14 @@ async function createNewSession(value: string): Promise<void> {
   padding: 8px 0;
 
   .url-input-label {
-    color: #1d2129;
+    color: var(--td-text-color-primary);
     font-size: 14px;
     font-weight: 500;
     margin-bottom: 8px;
   }
 
   .url-input-tip {
-    color: #86909c;
+    color: var(--td-text-color-secondary);
     font-size: 12px;
     margin-top: 8px;
     line-height: 1.5;
@@ -2928,7 +3376,7 @@ async function createNewSession(value: string): Promise<void> {
 }
 
 .knowledge-card-upload {
-  color: #000000e6;
+  color: var(--td-text-color-primary);
   font-family: "PingFang SC";
   font-size: 14px;
   font-weight: 400;
@@ -2938,7 +3386,7 @@ async function createNewSession(value: string): Promise<void> {
     margin: 33px auto 0;
     width: 112px;
     height: 32px;
-    border: 1px solid #dcdcdc;
+    border: 1px solid var(--td-component-border);
     display: flex;
     justify-content: center;
     align-items: center;
@@ -2951,7 +3399,7 @@ async function createNewSession(value: string): Promise<void> {
 }
 
 .upload-described {
-  color: #00000066;
+  color: var(--td-text-color-disabled);
   font-family: "PingFang SC";
   font-size: 12px;
   font-weight: 400;

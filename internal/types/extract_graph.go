@@ -10,7 +10,9 @@ const (
 	TypeIndexDelete         = "index:delete"          // 索引删除任务
 	TypeKBDelete            = "kb:delete"             // 知识库删除任务
 	TypeKnowledgeListDelete = "knowledge:list_delete" // 批量删除知识任务
+	TypeKnowledgeMove       = "knowledge:move"        // 知识移动任务
 	TypeDataTableSummary    = "datatable:summary"     // 表格摘要任务
+	TypeImageMultimodal     = "image:multimodal"      // 图片多模态处理任务（OCR + VLM Caption）
 )
 
 // ExtractChunkPayload represents the extract chunk task payload
@@ -30,6 +32,7 @@ type DocumentProcessPayload struct {
 	FileName                 string   `json:"file_name,omitempty"` // 文件名（文件导入时使用）
 	FileType                 string   `json:"file_type,omitempty"` // 文件类型（文件导入时使用）
 	URL                      string   `json:"url,omitempty"`       // URL（URL导入时使用）
+	FileURL                  string   `json:"file_url,omitempty"`  // 文件资源链接（file_url导入时使用）
 	Passages                 []string `json:"passages,omitempty"`  // 文本段落（文本导入时使用）
 	EnableMultimodel         bool     `json:"enable_multimodel"`
 	EnableQuestionGeneration bool     `json:"enable_question_generation"` // 是否启用问题生成
@@ -94,6 +97,44 @@ type KBDeletePayload struct {
 type KnowledgeListDeletePayload struct {
 	TenantID     uint64   `json:"tenant_id"`
 	KnowledgeIDs []string `json:"knowledge_ids"`
+}
+
+// KnowledgeMovePayload represents the knowledge move task payload
+type KnowledgeMovePayload struct {
+	TenantID     uint64   `json:"tenant_id"`
+	TaskID       string   `json:"task_id"`
+	KnowledgeIDs []string `json:"knowledge_ids"`
+	SourceKBID   string   `json:"source_kb_id"`
+	TargetKBID   string   `json:"target_kb_id"`
+	Mode         string   `json:"mode"` // "reuse_vectors" or "reparse"
+}
+
+// KnowledgeMoveProgress represents the progress of a knowledge move task
+type KnowledgeMoveProgress struct {
+	TaskID     string            `json:"task_id"`
+	SourceKBID string            `json:"source_kb_id"`
+	TargetKBID string            `json:"target_kb_id"`
+	Status     KBCloneTaskStatus `json:"status"`
+	Progress   int               `json:"progress"`   // 0-100
+	Total      int               `json:"total"`      // 总知识数
+	Processed  int               `json:"processed"`  // 已处理数
+	Failed     int               `json:"failed"`     // 失败数
+	Message    string            `json:"message"`    // 状态消息
+	Error      string            `json:"error"`      // 错误信息
+	CreatedAt  int64             `json:"created_at"` // 任务创建时间
+	UpdatedAt  int64             `json:"updated_at"` // 最后更新时间
+}
+
+// ImageMultimodalPayload represents the image multimodal processing task payload.
+type ImageMultimodalPayload struct {
+	TenantID        uint64 `json:"tenant_id"`
+	KnowledgeID     string `json:"knowledge_id"`
+	KnowledgeBaseID string `json:"knowledge_base_id"`
+	ChunkID         string `json:"chunk_id"`         // parent text chunk
+	ImageURL        string `json:"image_url"`        // provider:// URL (e.g. local://..., minio://...)
+	ImageLocalPath  string `json:"image_local_path"` // deprecated: kept for backward compat with in-flight tasks
+	EnableOCR       bool   `json:"enable_ocr"`
+	EnableCaption   bool   `json:"enable_caption"`
 }
 
 // KBCloneTaskStatus represents the status of a knowledge base clone task

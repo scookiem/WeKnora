@@ -15,7 +15,7 @@
             <t-loading size="small" />
           </div>
           <div v-else-if="templates.length === 0" class="template-empty">
-            {{ $t('promptTemplate.noTemplates') || '暂无模板' }}
+            {{ $t('promptTemplate.noTemplates') }}
           </div>
           <div v-else class="template-list">
             <div
@@ -25,7 +25,7 @@
               @click="selectTemplate(template)"
             >
               <div class="template-item-header">
-                <span class="template-name">{{ template.name }}</span>
+                <span class="template-name">{{ getTemplateName(template) }}</span>
                 <span v-if="template.has_knowledge_base" class="template-tag kb-tag">
                   <t-icon name="folder" size="12px" />
                   {{ $t('promptTemplate.withKnowledgeBase') }}
@@ -35,7 +35,7 @@
                   {{ $t('promptTemplate.withWebSearch') }}
                 </span>
               </div>
-              <p class="template-desc">{{ template.description }}</p>
+              <p class="template-desc">{{ getTemplateDesc(template) }}</p>
             </div>
           </div>
         </div>
@@ -55,7 +55,10 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue';
+import { useI18n } from 'vue-i18n';
 import { getPromptTemplates, type PromptTemplate, type PromptTemplatesConfig } from '@/api/system';
+
+const { t } = useI18n();
 
 const props = defineProps<{
   type: 'systemPrompt' | 'contextTemplate' | 'rewriteSystem' | 'rewriteUser' | 'fallback';
@@ -70,6 +73,57 @@ const emit = defineEmits<{
 const popupVisible = ref(false);
 const loading = ref(false);
 const templatesConfig = ref<PromptTemplatesConfig | null>(null);
+
+const templateI18nKeyMap: Record<string, Record<string, string>> = {
+  systemPrompt: {
+    default_kb: 'defaultKB',
+    expert_assistant: 'expert',
+    customer_service: 'customerService',
+    technical_support: 'techSupport',
+    pure_chat: 'pureChat',
+    web_search_assistant: 'webSearch',
+  },
+  contextTemplate: {
+    default_context: 'default',
+    detailed_context: 'detailed',
+    simple_context: 'simple',
+    qa_context: 'qa',
+  },
+  rewriteSystem: {
+    default_rewrite_system: 'default',
+    strict_rewrite_system: 'strict',
+  },
+  rewriteUser: {
+    default_rewrite_user: 'default',
+    detailed_rewrite_user: 'detailed',
+  },
+  fallback: {
+    default_fallback: 'default',
+    polite_fallback: 'polite',
+    brief_fallback: 'brief',
+    model_fallback: 'model',
+  },
+};
+
+function getTemplateName(template: PromptTemplate): string {
+  const key = templateI18nKeyMap[props.type]?.[template.id];
+  if (key) {
+    const i18nKey = `promptTemplate.${props.type}.${key}.name`;
+    const translated = t(i18nKey);
+    if (translated !== i18nKey) return translated;
+  }
+  return template.name;
+}
+
+function getTemplateDesc(template: PromptTemplate): string {
+  const key = templateI18nKeyMap[props.type]?.[template.id];
+  if (key) {
+    const i18nKey = `promptTemplate.${props.type}.${key}.desc`;
+    const translated = t(i18nKey);
+    if (translated !== i18nKey) return translated;
+  }
+  return template.description;
+}
 
 const handleVisibleChange = async (visible: boolean) => {
   popupVisible.value = visible;
@@ -140,17 +194,17 @@ onMounted(() => {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  color: #666;
-  border-color: #d9d9d9;
+  color: var(--td-text-color-secondary);
+  border-color: var(--td-component-stroke);
   font-size: 12px;
   height: 26px;
   padding: 0 8px;
-  background: rgba(255, 255, 255, 0.95);
-  
+  background: var(--td-bg-color-container);
+
   &:hover {
-    color: #07c05f;
-    border-color: #07c05f;
-    background: #fff;
+    color: var(--td-brand-color);
+    border-color: var(--td-brand-color);
+    background: var(--td-bg-color-secondarycontainer);
   }
   
   :deep(.t-button__text) {
@@ -175,21 +229,21 @@ onMounted(() => {
 
 .template-header {
   padding: 12px 16px;
-  border-bottom: 1px solid #e5e7eb;
+  border-bottom: 1px solid var(--td-component-stroke);
   flex-shrink: 0;
 }
 
 .template-title {
   font-size: 14px;
   font-weight: 500;
-  color: #333;
+  color: var(--td-text-color-primary);
 }
 
 .template-loading,
 .template-empty {
   padding: 40px 16px;
   text-align: center;
-  color: #999;
+  color: var(--td-text-color-placeholder);
   font-size: 13px;
 }
 
@@ -211,7 +265,7 @@ onMounted(() => {
   }
   
   &:hover {
-    background: #f5f7fa;
+    background: var(--td-bg-color-secondarycontainer);
   }
 }
 
@@ -226,7 +280,7 @@ onMounted(() => {
 .template-name {
   font-size: 14px;
   font-weight: 500;
-  color: #333;
+  color: var(--td-text-color-primary);
 }
 
 .template-tag {
@@ -238,19 +292,19 @@ onMounted(() => {
   font-size: 11px;
   
   &.kb-tag {
-    background: #e6f7ff;
-    color: #1890ff;
+    background: var(--td-brand-color-light);
+    color: var(--td-brand-color);
   }
   
   &.web-tag {
-    background: #f0faf5;
-    color: #07c05f;
+    background: var(--td-success-color-light);
+    color: var(--td-brand-color);
   }
 }
 
 .template-desc {
   font-size: 12px;
-  color: #666;
+  color: var(--td-text-color-secondary);
   margin: 0;
   line-height: 1.5;
   display: -webkit-box;

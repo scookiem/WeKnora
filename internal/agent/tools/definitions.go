@@ -1,5 +1,9 @@
 package tools
 
+// maxFunctionNameLength is the maximum length for a tool/function name
+// imposed by the OpenAI API.
+const maxFunctionNameLength = 64
+
 // Tool names constants
 const (
 	ToolThinking            = "thinking"
@@ -14,6 +18,7 @@ const (
 	ToolDataSchema          = "data_schema"
 	ToolWebSearch           = "web_search"
 	ToolWebFetch            = "web_fetch"
+	ToolFinalAnswer         = "final_answer"
 	// Skills-related tools (only available when skills are enabled)
 	ToolExecuteSkillScript = "execute_skill_script"
 	ToolReadSkill          = "read_skill"
@@ -42,6 +47,7 @@ func AvailableToolDefinitions() []AvailableTool {
 		{Name: ToolDataSchema, Label: "查看数据元信息", Description: "获取表格文件的元信息"},
 		{Name: ToolReadSkill, Label: "读取技能", Description: "按需读取技能内容以学习专业能力"},
 		{Name: ToolExecuteSkillScript, Label: "执行技能脚本", Description: "在沙箱环境中执行技能脚本"},
+		{Name: ToolFinalAnswer, Label: "提交最终回答", Description: "提交最终回答给用户"},
 	}
 }
 
@@ -58,5 +64,6 @@ func DefaultAllowedTools() []string {
 		ToolDatabaseQuery,
 		ToolDataAnalysis,
 		ToolDataSchema,
+		ToolFinalAnswer,
 	}
 }

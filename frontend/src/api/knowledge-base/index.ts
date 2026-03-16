@@ -19,7 +19,7 @@ export function createKnowledgeBase(data: {
     enabled: boolean;
     model_id?: string;
   };
-  cos_config?: any;
+  storage_config?: any;
   extract_config?: any;
   faq_config?: { index_mode: string; question_index_mode?: string };
 }) {
@@ -43,6 +43,30 @@ export function deleteKnowledgeBase(id: string) {
 
 export function copyKnowledgeBase(data: { source_id: string; target_id?: string }) {
   return post(`/api/v1/knowledge-bases/copy`, data);
+}
+
+// 获取可移动目标知识库列表（同类型、同Embedding模型）
+export function listMoveTargets(sourceKbId: string) {
+  return get(`/api/v1/knowledge-bases/${sourceKbId}/move-targets`);
+}
+
+// 移动知识到其他知识库
+export function moveKnowledge(data: {
+  knowledge_ids: string[];
+  source_kb_id: string;
+  target_kb_id: string;
+  mode: 'reuse_vectors' | 'reparse';
+}) {
+  return post('/api/v1/knowledge/move', data);
+}
+
+// 获取知识移动进度
+export function getKnowledgeMoveProgress(taskId: string) {
+  return get(`/api/v1/knowledge/move/progress/${taskId}`);
+}
+
+export function togglePinKnowledgeBase(id: string) {
+  return put(`/api/v1/knowledge-bases/${id}/pin`);
 }
 
 // 知识文件 API（基于具体知识库）
@@ -98,12 +122,20 @@ export function updateManualKnowledge(id: string, data: { title: string; content
   return put(`/api/v1/knowledge/manual/${id}`, data);
 }
 
+export function reparseKnowledge(id: string) {
+  return post(`/api/v1/knowledge/${id}/reparse`);
+}
+
 export function delKnowledgeDetails(id: string) {
   return del(`/api/v1/knowledge/${id}`);
 }
 
 export function downKnowledgeDetails(id: string) {
   return getDown(`/api/v1/knowledge/${id}/download`);
+}
+
+export function previewKnowledgeFile(id: string) {
+  return getDown(`/api/v1/knowledge/${id}/preview`);
 }
 
 /** @param idsQueryString - query string with ids (e.g. ids=xxx&ids=yyy) */
@@ -294,4 +326,12 @@ export function searchKnowledge(
   }
   if (options?.agent_id) query.set('agent_id', options.agent_id);
   return get(`/api/v1/knowledge/search?${query.toString()}`);
+}
+
+export function knowledgeSemanticSearch(data: {
+  query: string;
+  knowledge_base_ids?: string[];
+  knowledge_ids?: string[];
+}) {
+  return post('/api/v1/knowledge-search', data);
 }

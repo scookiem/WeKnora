@@ -1,6 +1,7 @@
 import { fetchEventSource } from '@microsoft/fetch-event-source'
 import { ref, type Ref, onUnmounted, nextTick } from 'vue'
 import { generateRandomString } from '@/utils/index';
+import i18n from '@/i18n';
 
 
 
@@ -28,7 +29,7 @@ export function useStream() {
   let renderTimer: number | null = null
 
   // 启动流式请求
-  const startStream = async (params: { session_id: any; query: any; knowledge_base_ids?: string[]; knowledge_ids?: string[]; agent_enabled?: boolean; agent_id?: string; web_search_enabled?: boolean; summary_model_id?: string; mcp_service_ids?: string[]; mentioned_items?: Array<{id: string; name: string; type: string; kb_type?: string}>; method: string; url: string }) => {
+  const startStream = async (params: { session_id: any; query: any; knowledge_base_ids?: string[]; knowledge_ids?: string[]; agent_enabled?: boolean; agent_id?: string; web_search_enabled?: boolean; enable_memory?: boolean; summary_model_id?: string; mcp_service_ids?: string[]; mentioned_items?: Array<{id: string; name: string; type: string; kb_type?: string}>; method: string; url: string }) => {
     // 重置状态
     output.value = '';
     error.value = null;
@@ -41,7 +42,7 @@ export function useStream() {
     // 获取JWT Token
     const token = localStorage.getItem('weknora_token');
     if (!token) {
-      error.value = "未找到登录令牌，请重新登录";
+      error.value = i18n.global.t('error.tokenNotFound');
       stopStream();
       return;
     }
@@ -97,6 +98,10 @@ export function useStream() {
       if (params.web_search_enabled !== undefined) {
         postBody.web_search_enabled = params.web_search_enabled;
       }
+      // Include enable_memory if provided
+      if (params.enable_memory !== undefined) {
+        postBody.enable_memory = params.enable_memory;
+      }
       // Include summary_model_id if provided (for non-Agent mode)
       if (params.summary_model_id) {
         postBody.summary_model_id = params.summary_model_id;
@@ -139,7 +144,7 @@ export function useStream() {
         },
 
         onerror: (err) => {
-          throw new Error(`流式连接失败: ${err}`);
+          throw new Error(`${i18n.global.t('error.streamFailed')}: ${err}`);
         },
 
         onclose: () => {

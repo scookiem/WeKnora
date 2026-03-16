@@ -26,7 +26,7 @@ type KnowledgeBaseHandler struct {
 	knowledgeService  interfaces.KnowledgeService
 	kbShareService    interfaces.KBShareService
 	agentShareService interfaces.AgentShareService
-	asynqClient       *asynq.Client
+	asynqClient       interfaces.TaskEnqueuer
 }
 
 // NewKnowledgeBaseHandler creates a new knowledge base handler instance
@@ -35,7 +35,7 @@ func NewKnowledgeBaseHandler(
 	knowledgeService interfaces.KnowledgeService,
 	kbShareService interfaces.KBShareService,
 	agentShareService interfaces.AgentShareService,
-	asynqClient *asynq.Client,
+	asynqClient interfaces.TaskEnqueuer,
 ) *KnowledgeBaseHandler {
 	return &KnowledgeBaseHandler{
 		service:           service,
@@ -383,6 +383,43 @@ func (h *KnowledgeBaseHandler) ListKnowledgeBases(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"data":    kbs,
+	})
+}
+
+// TogglePinKnowledgeBase godoc
+// @Summary      置顶/取消置顶知识库
+// @Description  切换知识库的置顶状态
+// @Tags         知识库
+// @Accept       json
+// @Produce      json
+// @Param        id  path      string  true  "知识库ID"
+// @Success      200  {object}  map[string]interface{}  "更新后的知识库"
+// @Failure      404  {object}  errors.AppError         "知识库不存在"
+// @Security     Bearer
+// @Security     ApiKeyAuth
+// @Router       /knowledge-bases/{id}/pin [put]
+func (h *KnowledgeBaseHandler) TogglePinKnowledgeBase(c *gin.Context) {
+	ctx := c.Request.Context()
+	id := c.Param("id")
+	if id == "" {
+		c.Error(apperrors.NewBadRequestError("knowledge base ID is required"))
+		return
+	}
+
+	kb, err := h.service.TogglePinKnowledgeBase(ctx, id)
+	if err != nil {
+		if stderrors.Is(err, repository.ErrKnowledgeBaseNotFound) {
+			c.Error(apperrors.NewNotFoundError("knowledge base not found"))
+			return
+		}
+		logger.ErrorWithFields(ctx, err, nil)
+		c.Error(apperrors.NewInternalServerError(err.Error()))
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    kb,
 	})
 }
 
@@ -740,4 +777,67 @@ func validateExtractConfig(config *types.ExtractConfig) error {
 	}
 
 	return nil
+}
+
+// ListMoveTargets returns knowledge bases eligible as move targets for the given source KB.
+// Filters: same Type, same EmbeddingModelID, different ID, not temporary.
+func (h *KnowledgeBaseHandler) ListMoveTargets(c *gin.Context) {
+	ctx := c.Request.Context()
+
+	sourceKBID := c.Param("id")
+	if sourceKBID == "" {
+		c.Error(apperrors.NewBadRequestError("Knowledge base ID is required"))
+		return
+	}
+
+	tenantID, exists := c.Get(types.TenantIDContextKey.String())
+	if !exists {
+		c.Error(apperrors.NewUnauthorizedError("Unauthorized"))
+		return
+	}
+
+	// Get source knowledge base
+	sourceKB, err := h.service.GetKnowledgeBaseByID(ctx, sourceKBID)
+	if err != nil {
+		if stderrors.Is(err, repository.ErrKnowledgeBaseNotFound) {
+			c.Error(errors.NewNotFoundError("Source knowledge base not found"))
+			return
+		}
+		c.Error(errors.NewInternalServerError(err.Error()))
+		return
+	}
+	if sourceKB.TenantID != tenantID.(uint64) {
+		c.Error(errors.NewForbiddenError("No permission to access this knowledge base"))
+		return
+	}
+
+	// Get all knowledge bases
+	allKBs, err := h.service.ListKnowledgeBases(ctx)
+	if err != nil {
+		c.Error(errors.NewInternalServerError(err.Error()))
+		return
+	}
+
+	// Filter eligible targets
+	targets := make([]*types.KnowledgeBase, 0)
+	for _, kb := range allKBs {
+		if kb.ID == sourceKBID {
+			continue
+		}
+		if kb.IsTemporary {
+			continue
+		}
+		if kb.Type != sourceKB.Type {
+			continue
+		}
+		if kb.EmbeddingModelID != sourceKB.EmbeddingModelID {
+			continue
+		}
+		targets = append(targets, kb)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    targets,
+	})
 }

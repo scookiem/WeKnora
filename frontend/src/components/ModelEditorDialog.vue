@@ -1,7 +1,7 @@
 <template>
   <Teleport to="body">
     <Transition name="modal">
-      <div v-if="dialogVisible" class="model-editor-overlay" @click.self="handleCancel">
+      <div v-if="dialogVisible" class="model-editor-overlay" @mousedown.self="handleOverlayMouseDown" @mouseup.self="handleOverlayMouseUp">
         <div class="model-editor-modal">
           <!-- 关闭按钮 -->
           <button class="close-btn" @click="handleCancel" :aria-label="$t('common.close')">
@@ -274,7 +274,7 @@ interface Props {
   modelData?: ModelFormData | null
 }
 
-const { t } = useI18n()
+const { t, te } = useI18n()
 const uiStore = useUIStore()
 
 const props = withDefaults(defineProps<Props>(), {
@@ -356,6 +356,18 @@ const fallbackProviderOptions = computed(() => [
     description: t('model.editor.providers.jina.description'),
     modelTypes: ['embedding', 'rerank']
   },
+  {
+    value: 'nvidia',
+    label: t('model.editor.providers.nvidia.label'),
+    defaultUrls: {
+      chat: 'https://integrate.api.nvidia.com/v1/chat/completions',
+      embedding: 'https://integrate.api.nvidia.com/v1',
+      rerank: 'https://ai.api.nvidia.com/v1/retrieval/nvidia/reranking',
+      vllm: 'https://integrate.api.nvidia.com/v1',
+    },
+    description: t('model.editor.providers.nvidia.description'),
+    modelTypes: ['chat', 'embedding', 'rerank', 'vllm']
+  },
   { 
     value: 'generic', 
     label: t('model.editor.providers.generic.label'), 
@@ -381,13 +393,22 @@ const loadProviders = async () => {
 }
 
 // 根据当前模型类型过滤的 Provider 列表
+// API 返回的 defaultUrls/modelTypes 数据优先，但 label/description 使用 i18n
 const providerOptions = computed(() => {
-  // 优先使用 API 返回的数据
+  // API 数据可用时，用 API 的结构数据 + i18n 的显示文本
   if (apiProviderOptions.value.length > 0) {
-    return apiProviderOptions.value
+    return apiProviderOptions.value.map(p => ({
+      ...p,
+      label: te(`model.editor.providers.${p.value}.label`)
+        ? t(`model.editor.providers.${p.value}.label`)
+        : p.label,
+      description: te(`model.editor.providers.${p.value}.description`)
+        ? t(`model.editor.providers.${p.value}.description`)
+        : p.description,
+    }))
   }
   // 回退到硬编码值，按 modelTypes 过滤
-  return fallbackProviderOptions.value.filter(p => 
+  return fallbackProviderOptions.value.filter(p =>
     p.modelTypes.includes(props.modelType)
   )
 })
@@ -716,14 +737,17 @@ const checkOllamaDimension = async () => {
       dimensionMessage.value = t('model.editor.dimensionDetected', { value: result.dimension })
       MessagePlugin.success(dimensionMessage.value)
     } else {
-      dimensionMessage.value = result.message || t('model.editor.dimensionFailed')
+      if (result.message) {
+        console.debug('Backend dimension message:', result.message)
+      }
+      dimensionMessage.value = t('model.editor.dimensionFailed')
       MessagePlugin.warning(dimensionMessage.value)
     }
   } catch (error: any) {
-    console.error('检测 Ollama 模型维度失败:', error)
+    console.error('Ollama dimension check failed:', error)
     dimensionChecked.value = true
     dimensionSuccess.value = false
-    dimensionMessage.value = error.message || t('model.editor.dimensionFailed')
+    dimensionMessage.value = t('model.editor.dimensionFailed')
     MessagePlugin.error(dimensionMessage.value)
   } finally {
     checking.value = false
@@ -798,18 +822,24 @@ const checkRemoteAPI = async () => {
     
     remoteChecked.value = true
     remoteAvailable.value = result.available || false
-    remoteMessage.value = result.message || (result.available ? t('model.editor.connectionSuccess') : t('model.editor.connectionFailed'))
-    
+    // Always use i18n for display; backend message is for debugging only
+    if (result.message) {
+      console.debug('Backend message:', result.message)
+    }
+    remoteMessage.value = result.available
+      ? t('model.editor.connectionSuccess')
+      : t('model.editor.connectionFailed')
+
     if (result.available) {
       MessagePlugin.success(remoteMessage.value)
     } else {
       MessagePlugin.error(remoteMessage.value)
     }
   } catch (error: any) {
-    console.error('Remote API 校验失败:', error)
+    console.error('Remote API check failed:', error)
     remoteChecked.value = true
     remoteAvailable.value = false
-    remoteMessage.value = error.message || t('model.editor.connectionConfigError')
+    remoteMessage.value = t('model.editor.connectionConfigError')
     MessagePlugin.error(remoteMessage.value)
   } finally {
     checking.value = false
@@ -947,7 +977,8 @@ const startDownload = async (modelName: string) => {
     downloading.value = false
     downloadProgress.value = 0
     currentDownloadModel.value = ''
-    MessagePlugin.error(error.message || t('model.editor.downloadStartFailed'))
+    console.error('Download start failed:', error)
+    MessagePlugin.error(t('model.editor.downloadStartFailed'))
   }
 }
 
@@ -992,6 +1023,19 @@ watch(() => formData.value.modelName, () => {
 const handleCancel = () => {
   dialogVisible.value = false
 }
+
+// 遮罩层点击关闭：只有 mousedown 和 mouseup 都发生在遮罩层上才关闭，
+// 防止在输入框中拖选文字时鼠标滑出弹窗导致误关闭
+let overlayMouseDownFired = false
+const handleOverlayMouseDown = () => {
+  overlayMouseDownFired = true
+}
+const handleOverlayMouseUp = () => {
+  if (overlayMouseDownFired) {
+    handleCancel()
+  }
+  overlayMouseDownFired = false
+}
 </script>
 
 <style lang="less" scoped>
@@ -1018,7 +1062,7 @@ const handleCancel = () => {
   width: 100%;
   max-width: 560px;
   max-height: 90vh;
-  background: #fff;
+  background: var(--td-bg-color-container);
   border-radius: 12px;
   box-shadow: 0 6px 28px rgba(15, 23, 42, 0.08);
   display: flex;
@@ -1040,20 +1084,20 @@ const handleCancel = () => {
   display: flex;
   align-items: center;
   justify-content: center;
-  color: #666666;
+  color: var(--td-text-color-secondary);
   transition: all 0.15s ease;
   z-index: 10;
 
   &:hover {
-    background: #f5f5f5;
-    color: #333333;
+    background: var(--td-bg-color-secondarycontainer);
+    color: var(--td-text-color-primary);
   }
 }
 
 // 标题区域
 .modal-header {
   padding: 24px 24px 16px;
-  border-bottom: 1px solid #e5e7eb;
+  border-bottom: 1px solid var(--td-component-stroke);
   flex-shrink: 0;
 }
 
@@ -1061,13 +1105,13 @@ const handleCancel = () => {
   margin: 0 0 6px 0;
   font-size: 18px;
   font-weight: 600;
-  color: #333333;
+  color: var(--td-text-color-primary);
 }
 
 .modal-desc {
   margin: 0;
   font-size: 13px;
-  color: #666666;
+  color: var(--td-text-color-secondary);
   line-height: 1.5;
 }
 
@@ -1076,7 +1120,7 @@ const handleCancel = () => {
   flex: 1;
   overflow-y: auto;
   padding: 24px;
-  background: #ffffff;
+  background: var(--td-bg-color-container);
 
   // 自定义滚动条
   &::-webkit-scrollbar {
@@ -1084,17 +1128,17 @@ const handleCancel = () => {
   }
 
   &::-webkit-scrollbar-track {
-    background: #f5f5f5;
+    background: var(--td-bg-color-secondarycontainer);
     border-radius: 3px;
   }
 
   &::-webkit-scrollbar-thumb {
-    background: #d0d0d0;
+    background: var(--td-bg-color-component-disabled);
     border-radius: 3px;
     transition: background 0.15s;
 
     &:hover {
-      background: #b0b0b0;
+      background: var(--td-bg-color-component-disabled);
     }
   }
 
@@ -1119,11 +1163,11 @@ const handleCancel = () => {
   margin-bottom: 8px;
   font-size: 14px;
   font-weight: 500;
-  color: #333333;
+  color: var(--td-text-color-primary);
 
   &.required::after {
     content: '*';
-    color: #f56c6c;
+    color: var(--td-error-color);
     margin-left: 4px;
     font-weight: 600;
   }
@@ -1143,7 +1187,7 @@ const handleCancel = () => {
   textarea {
     font-size: 13px;
     border-radius: 6px;
-    border-color: #d9d9d9;
+    border-color: var(--td-component-stroke);
     transition: all 0.15s ease;
   }
 
@@ -1151,14 +1195,14 @@ const handleCancel = () => {
   &:hover .t-input__wrap,
   &:hover input,
   &:hover textarea {
-    border-color: #b3b3b3;
+    border-color: var(--td-component-stroke);
   }
 
   &.t-is-focused .t-input__inner,
   &.t-is-focused .t-input__wrap,
   &.t-is-focused input,
   &.t-is-focused textarea {
-    border-color: #07C05F;
+    border-color: var(--td-brand-color);
     box-shadow: 0 0 0 2px rgba(7, 192, 95, 0.1);
   }
 }
@@ -1173,12 +1217,12 @@ const handleCancel = () => {
   .provider-name {
     font-size: 14px;
     font-weight: 500;
-    color: #333333;
+    color: var(--td-text-color-primary);
   }
 
   .provider-desc {
     font-size: 12px;
-    color: #999999;
+    color: var(--td-text-color-placeholder);
   }
 }
 
@@ -1193,19 +1237,19 @@ const handleCancel = () => {
 
     &:hover {
       .t-radio__label {
-        color: #07C05F;
+        color: var(--td-brand-color);
       }
     }
   }
 
   .t-radio__label {
     font-size: 13px;
-    color: #333333;
+    color: var(--td-text-color-primary);
     transition: color 0.15s ease;
   }
 
   .t-radio__input:checked + .t-radio__label {
-    color: #07C05F;
+    color: var(--td-brand-color);
     font-weight: 500;
   }
 }
@@ -1216,19 +1260,19 @@ const handleCancel = () => {
 
   .t-checkbox__label {
     font-size: 13px;
-    color: #333333;
+    color: var(--td-text-color-primary);
   }
 }
 
 // 底部按钮区域
 .modal-footer {
   padding: 16px 24px;
-  border-top: 1px solid #e5e7eb;
+  border-top: 1px solid var(--td-component-stroke);
   display: flex;
   justify-content: flex-end;
   gap: 12px;
   flex-shrink: 0;
-  background: #fafafa;
+  background: var(--td-bg-color-secondarycontainer);
 
   :deep(.t-button) {
     min-width: 80px;
@@ -1239,27 +1283,27 @@ const handleCancel = () => {
     transition: all 0.15s ease;
 
     &.t-button--theme-primary {
-      background: #07C05F;
-      border-color: #07C05F;
+      background: var(--td-brand-color);
+      border-color: var(--td-brand-color);
 
       &:hover {
-        background: #06b04d;
-        border-color: #06b04d;
+        background: var(--td-brand-color);
+        border-color: var(--td-brand-color);
       }
 
       &:active {
-        background: #059642;
-        border-color: #059642;
+        background: var(--td-brand-color-active);
+        border-color: var(--td-brand-color-active);
       }
     }
 
     &.t-button--variant-outline {
-      color: #666666;
-      border-color: #d9d9d9;
+      color: var(--td-text-color-secondary);
+      border-color: var(--td-component-stroke);
 
       &:hover {
-        border-color: #07C05F;
-        color: #07C05F;
+        border-color: var(--td-brand-color);
+        color: var(--td-brand-color);
         background: rgba(7, 192, 95, 0.04);
       }
     }
@@ -1298,11 +1342,11 @@ const handleCancel = () => {
     flex: 1;
 
     &.success {
-      color: #059669;
+      color: var(--td-brand-color-active);
     }
 
     &.error {
-      color: #f56c6c;
+      color: var(--td-error-color);
     }
   }
 
@@ -1319,11 +1363,11 @@ const handleCancel = () => {
     flex-shrink: 0;
 
     &.available {
-      color: #07C05F;
+      color: var(--td-brand-color);
     }
 
     &.unavailable {
-      color: #f56c6c;
+      color: var(--td-error-color);
     }
   }
 }
@@ -1338,31 +1382,31 @@ const handleCancel = () => {
   
   .downloaded-icon {
     font-size: 14px;
-    color: #07C05F;
+    color: var(--td-brand-color);
     flex-shrink: 0;
   }
   
   .download-icon {
     font-size: 14px;
-    color: #07C05F;
+    color: var(--td-brand-color);
     flex-shrink: 0;
   }
   
   .model-name {
     flex: 1;
     font-size: 13px;
-    color: #333333;
+    color: var(--td-text-color-primary);
   }
   
   .model-size {
     font-size: 12px;
-    color: #999999;
+    color: var(--td-text-color-placeholder);
     margin-left: auto;
   }
   
   &.download {
     .model-name {
-      color: #07C05F;
+      color: var(--td-brand-color);
       font-weight: 500;
     }
   }
@@ -1378,13 +1422,13 @@ const handleCancel = () => {
   .spinning {
     animation: spin 1s linear infinite;
     font-size: 14px;
-    color: #07C05F;
+    color: var(--td-brand-color);
   }
   
   .progress-text {
     font-size: 12px;
     font-weight: 500;
-    color: #07C05F;
+    color: var(--td-brand-color);
   }
 }
 
@@ -1436,11 +1480,11 @@ const handleCancel = () => {
 .refresh-btn {
   margin-top: 0;
   font-size: 13px;
-  color: #666666;
+  color: var(--td-text-color-secondary);
   flex-shrink: 0;
 
   &:hover {
-    color: #07C05F;
+    color: var(--td-brand-color);
     background: rgba(7, 192, 95, 0.04);
   }
 }
@@ -1470,10 +1514,10 @@ const handleCancel = () => {
   margin: 8px 0 0 0;
   font-size: 13px;
   line-height: 1.5;
-  color: #e34d59;
+  color: var(--td-error-color);
 
   &.success {
-    color: #07C05F;
+    color: var(--td-brand-color);
   }
 }
 
@@ -1484,41 +1528,41 @@ const handleCancel = () => {
   gap: 8px;
   margin-top: 12px;
   padding: 10px 12px;
-  background: #fef2f2;
-  border: 1px solid #fecaca;
+  background: var(--td-error-color-light);
+  border: 1px solid var(--td-error-color-focus);
   border-radius: 6px;
   font-size: 13px;
 
   .tip-icon {
-    color: #f56c6c;
+    color: var(--td-error-color);
     font-size: 16px;
     flex-shrink: 0;
     margin-right: 2px;
 
     &.info {
-      color: #07C05F;
+      color: var(--td-brand-color);
     }
   }
 
   .tip-text {
-    color: #dc2626;
+    color: var(--td-error-color);
     flex: 1;
     line-height: 1.5;
   }
 
   // ReRank提示使用主题绿色风格，与主页面保持一致
   &.rerank-tip {
-    background: #f0fdf6;
-    border: 1px solid #d1fae5;
-    border-left: 3px solid #07C05F;
+    background: var(--td-success-color-light);
+    border: 1px solid var(--td-success-color-focus);
+    border-left: 3px solid var(--td-brand-color);
 
     .tip-text {
-      color: #166534;
+      color: var(--td-success-color);
     }
   }
 
   :deep(.tip-link) {
-    color: #07C05F;
+    color: var(--td-brand-color);
     font-size: 13px;
     font-weight: 500;
     padding: 4px 6px 4px 10px !important;
@@ -1535,7 +1579,7 @@ const handleCancel = () => {
 
     &:hover {
       background: rgba(7, 192, 95, 0.08) !important;
-      color: #05a04f !important;
+      color: var(--td-brand-color-active) !important;
     }
 
     &:active {

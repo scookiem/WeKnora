@@ -8,23 +8,29 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
+	goerrors "errors"
+
+	"github.com/Tencent/WeKnora/internal/application/repository"
 	"github.com/Tencent/WeKnora/internal/application/service"
 	"github.com/Tencent/WeKnora/internal/errors"
 	"github.com/Tencent/WeKnora/internal/logger"
-	goerrors "errors"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
+	"github.com/Tencent/WeKnora/internal/utils"
 	secutils "github.com/Tencent/WeKnora/internal/utils"
 	"github.com/gin-gonic/gin"
+	"github.com/hibiken/asynq"
 )
 
 // KnowledgeHandler processes HTTP requests related to knowledge resources
 type KnowledgeHandler struct {
-	kgService        interfaces.KnowledgeService
-	kbService        interfaces.KnowledgeBaseService
-	kbShareService   interfaces.KBShareService
+	kgService         interfaces.KnowledgeService
+	kbService         interfaces.KnowledgeBaseService
+	kbShareService    interfaces.KBShareService
 	agentShareService interfaces.AgentShareService
+	asynqClient       interfaces.TaskEnqueuer
 }
 
 // NewKnowledgeHandler creates a new knowledge handler instance
@@ -33,84 +39,22 @@ func NewKnowledgeHandler(
 	kbService interfaces.KnowledgeBaseService,
 	kbShareService interfaces.KBShareService,
 	agentShareService interfaces.AgentShareService,
+	asynqClient interfaces.TaskEnqueuer,
 ) *KnowledgeHandler {
 	return &KnowledgeHandler{
-		kgService:        kgService,
-		kbService:        kbService,
-		kbShareService:   kbShareService,
+		kgService:         kgService,
+		kbService:         kbService,
+		kbShareService:    kbShareService,
 		agentShareService: agentShareService,
+		asynqClient:       asynqClient,
 	}
 }
 
 // validateKnowledgeBaseAccess validates access permissions to a knowledge base
-// Returns the knowledge base, the knowledge base ID, effective tenant ID, permission level, and any errors encountered
-// For owned KBs, effectiveTenantID is the caller's tenant ID
-// For shared KBs, effectiveTenantID is the source tenant ID (owner's tenant)
+// using the ":id" URL path parameter. It delegates to validateKnowledgeBaseAccessWithKBID.
 func (h *KnowledgeHandler) validateKnowledgeBaseAccess(c *gin.Context) (*types.KnowledgeBase, string, uint64, types.OrgMemberRole, error) {
-	ctx := c.Request.Context()
-
-	// Get tenant ID from context
-	tenantID := c.GetUint64(types.TenantIDContextKey.String())
-	if tenantID == 0 {
-		logger.Error(ctx, "Failed to get tenant ID")
-		return nil, "", 0, "", errors.NewUnauthorizedError("Unauthorized")
-	}
-
-	// Get user ID from context (needed for shared KB permission check)
-	userID, userExists := c.Get(types.UserIDContextKey.String())
-
-	// Get knowledge base ID from URL path parameter
 	kbID := secutils.SanitizeForLog(c.Param("id"))
-	if kbID == "" {
-		logger.Error(ctx, "Knowledge base ID is empty")
-		return nil, "", 0, "", errors.NewBadRequestError("Knowledge base ID cannot be empty")
-	}
-
-	// Get knowledge base details
-	kb, err := h.kbService.GetKnowledgeBaseByID(ctx, kbID)
-	if err != nil {
-		logger.ErrorWithFields(ctx, err, nil)
-		return nil, kbID, 0, "", errors.NewInternalServerError(err.Error())
-	}
-
-	// Check 1: Verify tenant ownership (owner has full access)
-	if kb.TenantID == tenantID {
-		return kb, kbID, tenantID, types.OrgRoleAdmin, nil
-	}
-
-	// Check 2: If not owner, check organization shared access
-	if userExists && h.kbShareService != nil {
-		// Check if user has shared access through organization
-		permission, isShared, permErr := h.kbShareService.CheckUserKBPermission(ctx, kbID, userID.(string))
-		if permErr == nil && isShared {
-			// User has shared access, get the source tenant ID for queries
-			sourceTenantID, srcErr := h.kbShareService.GetKBSourceTenant(ctx, kbID)
-			if srcErr == nil {
-				logger.Infof(ctx, "User %s accessing shared KB %s with permission %s, source tenant: %d",
-					userID.(string), kbID, permission, sourceTenantID)
-				return kb, kbID, sourceTenantID, permission, nil
-			}
-		}
-	}
-
-	// Check 3: If not owner and no direct share, allow if user has any shared agent that can access this KB (e.g. opened from "通过智能体可见" list)
-	if userExists && h.agentShareService != nil {
-		can, err := h.agentShareService.UserCanAccessKBViaSomeSharedAgent(ctx, userID.(string), tenantID, kb)
-		if err == nil && can {
-			logger.Infof(ctx, "User %s accessing KB %s via some shared agent", userID.(string), kbID)
-			return kb, kbID, kb.TenantID, types.OrgRoleViewer, nil
-		}
-	}
-
-	// No permission: not owner and no shared access
-	logger.Warnf(
-		ctx,
-		"Permission denied to access this knowledge base, tenant ID mismatch, "+
-			"requested tenant ID: %d, knowledge base tenant ID: %d",
-		tenantID,
-		kb.TenantID,
-	)
-	return nil, kbID, 0, "", errors.NewForbiddenError("Permission denied to access this knowledge base")
+	return h.validateKnowledgeBaseAccessWithKBID(c, kbID)
 }
 
 // validateKnowledgeBaseAccessWithKBID validates access to the given knowledge base ID (e.g. from query or body).
@@ -365,12 +309,12 @@ func (h *KnowledgeHandler) CreateKnowledgeFromFile(c *gin.Context) {
 
 // CreateKnowledgeFromURL godoc
 // @Summary      从URL创建知识
-// @Description  从指定URL抓取内容并创建知识条目
+// @Description  从指定URL抓取内容并创建知识条目。当提供 file_name/file_type 或 URL 路径含已知文件扩展名时，自动切换为文件下载模式
 // @Tags         知识管理
 // @Accept       json
 // @Produce      json
 // @Param        id       path      string  true  "知识库ID"
-// @Param        request  body      object{url=string,enable_multimodel=bool,title=string,tag_id=string}  true  "URL请求"
+// @Param        request  body      object{url=string,file_name=string,file_type=string,enable_multimodel=bool,title=string,tag_id=string}  true  "URL请求"
 // @Success      201      {object}  map[string]interface{}  "创建的知识"
 // @Failure      400      {object}  errors.AppError         "请求参数错误"
 // @Failure      409      {object}  map[string]interface{}  "URL重复"
@@ -398,6 +342,8 @@ func (h *KnowledgeHandler) CreateKnowledgeFromURL(c *gin.Context) {
 	// Parse URL from request body
 	var req struct {
 		URL              string `json:"url" binding:"required"`
+		FileName         string `json:"file_name"`
+		FileType         string `json:"file_type"`
 		EnableMultimodel *bool  `json:"enable_multimodel"`
 		Title            string `json:"title"`
 		TagID            string `json:"tag_id"`
@@ -408,19 +354,26 @@ func (h *KnowledgeHandler) CreateKnowledgeFromURL(c *gin.Context) {
 		return
 	}
 
-	logger.Infof(ctx, "Received URL request: %s", secutils.SanitizeForLog(req.URL))
-	logger.Infof(
-		ctx,
+	logger.Infof(ctx, "Received URL request: %s, file_name: %s, file_type: %s",
+		secutils.SanitizeForLog(req.URL),
+		secutils.SanitizeForLog(req.FileName),
+		secutils.SanitizeForLog(req.FileType),
+	)
+	logger.Infof(ctx,
 		"Creating knowledge from URL, knowledge base ID: %s, URL: %s",
 		secutils.SanitizeForLog(kbID),
 		secutils.SanitizeForLog(req.URL),
 	)
 
 	// Create knowledge entry from the URL
-	knowledge, err := h.kgService.CreateKnowledgeFromURL(ctx, kbID, req.URL, req.EnableMultimodel, req.Title, req.TagID)
+	knowledge, err := h.kgService.CreateKnowledgeFromURL(ctx, kbID, req.URL, req.FileName, req.FileType, req.EnableMultimodel, req.Title, req.TagID)
 	// Check for duplicate knowledge error
 	if err != nil {
 		if h.handleDuplicateKnowledgeError(c, err, knowledge, "url") {
+			return
+		}
+		if appErr, ok := errors.IsAppError(err); ok {
+			c.Error(appErr)
 			return
 		}
 		logger.ErrorWithFields(ctx, err, nil)
@@ -728,6 +681,102 @@ func (h *KnowledgeHandler) DownloadKnowledgeFile(c *gin.Context) {
 	})
 }
 
+// mimeTypeByExt returns the MIME type for a given file extension.
+func mimeTypeByExt(filename string) string {
+	ext := strings.ToLower(filename)
+	if idx := strings.LastIndex(ext, "."); idx >= 0 {
+		ext = ext[idx:]
+	} else {
+		ext = ""
+	}
+	m := map[string]string{
+		".pdf":      "application/pdf",
+		".docx":     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+		".doc":      "application/msword",
+		".pptx":     "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+		".ppt":      "application/vnd.ms-powerpoint",
+		".xlsx":     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+		".xls":      "application/vnd.ms-excel",
+		".csv":      "text/csv",
+		".jpg":      "image/jpeg",
+		".jpeg":     "image/jpeg",
+		".png":      "image/png",
+		".gif":      "image/gif",
+		".bmp":      "image/bmp",
+		".webp":     "image/webp",
+		".svg":      "image/svg+xml",
+		".tiff":     "image/tiff",
+		".txt":      "text/plain; charset=utf-8",
+		".md":       "text/markdown; charset=utf-8",
+		".markdown": "text/markdown; charset=utf-8",
+		".json":     "application/json; charset=utf-8",
+		".xml":      "application/xml; charset=utf-8",
+		".html":     "text/html; charset=utf-8",
+		".css":      "text/css; charset=utf-8",
+		".js":       "text/javascript; charset=utf-8",
+		".ts":       "text/typescript; charset=utf-8",
+		".py":       "text/x-python; charset=utf-8",
+		".go":       "text/x-go; charset=utf-8",
+		".java":     "text/x-java; charset=utf-8",
+		".yaml":     "text/yaml; charset=utf-8",
+		".yml":      "text/yaml; charset=utf-8",
+		".sh":       "text/x-shellscript; charset=utf-8",
+	}
+	if ct, ok := m[ext]; ok {
+		return ct
+	}
+	return "application/octet-stream"
+}
+
+// PreviewKnowledgeFile godoc
+// @Summary      预览知识文件
+// @Description  返回知识条目关联的原始文件，Content-Type 根据文件类型设置，用于浏览器内嵌预览
+// @Tags         知识管理
+// @Accept       json
+// @Produce      application/pdf,image/jpeg,image/png,text/plain
+// @Param        id   path      string  true  "知识ID"
+// @Success      200  {file}    file    "文件内容"
+// @Failure      400  {object}  errors.AppError  "请求参数错误"
+// @Security     Bearer
+// @Security     ApiKeyAuth
+// @Router       /knowledge/{id}/preview [get]
+func (h *KnowledgeHandler) PreviewKnowledgeFile(c *gin.Context) {
+	ctx := c.Request.Context()
+
+	id := secutils.SanitizeForLog(c.Param("id"))
+	if id == "" {
+		c.Error(errors.NewBadRequestError("Knowledge ID cannot be empty"))
+		return
+	}
+
+	_, effCtx, err := h.resolveKnowledgeAndValidateKBAccess(c, id, types.OrgRoleViewer)
+	if err != nil {
+		c.Error(err)
+		return
+	}
+
+	file, filename, err := h.kgService.GetKnowledgeFile(effCtx, id)
+	if err != nil {
+		logger.ErrorWithFields(ctx, err, nil)
+		c.Error(errors.NewInternalServerError("Failed to retrieve file").WithDetails(err.Error()))
+		return
+	}
+	defer file.Close()
+
+	contentType := mimeTypeByExt(filename)
+	c.Header("Content-Type", contentType)
+	c.Header("Content-Disposition", fmt.Sprintf("inline; filename=%s", filename))
+	c.Header("Cache-Control", "private, max-age=3600")
+
+	c.Stream(func(w io.Writer) bool {
+		if _, err := io.Copy(w, file); err != nil {
+			logger.Errorf(ctx, "Failed to stream preview: %v", err)
+			return false
+		}
+		return false
+	})
+}
+
 // GetKnowledgeBatchRequest defines parameters for batch knowledge retrieval
 type GetKnowledgeBatchRequest struct {
 	IDs     []string `form:"ids" binding:"required"` // List of knowledge IDs
@@ -934,6 +983,59 @@ func (h *KnowledgeHandler) UpdateManualKnowledge(c *gin.Context) {
 	logger.Infof(ctx, "Manual knowledge updated successfully, knowledge ID: %s", id)
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
+		"data":    knowledge,
+	})
+}
+
+// ReparseKnowledge godoc
+// @Summary      重新解析知识
+// @Description  删除知识中现有的文档内容并重新解析，使用异步任务方式处理
+// @Tags         知识管理
+// @Accept       json
+// @Produce      json
+// @Param        id   path      string  true  "知识ID"
+// @Success      200  {object}  map[string]interface{}  "重新解析任务已提交"
+// @Failure      400  {object}  errors.AppError         "请求参数错误"
+// @Failure      403  {object}  errors.AppError         "权限不足"
+// @Security     Bearer
+// @Security     ApiKeyAuth
+// @Router       /knowledge/{id}/reparse [post]
+func (h *KnowledgeHandler) ReparseKnowledge(c *gin.Context) {
+	ctx := c.Request.Context()
+	logger.Info(ctx, "Start re-parsing knowledge")
+
+	id := secutils.SanitizeForLog(c.Param("id"))
+	if id == "" {
+		logger.Error(ctx, "Knowledge ID is empty")
+		c.Error(errors.NewBadRequestError("Knowledge ID cannot be empty"))
+		return
+	}
+
+	// Validate KB access with editor permission (reparse requires write access)
+	_, effCtx, err := h.resolveKnowledgeAndValidateKBAccess(c, id, types.OrgRoleEditor)
+	if err != nil {
+		c.Error(err)
+		return
+	}
+
+	// Call service to reparse knowledge
+	knowledge, err := h.kgService.ReparseKnowledge(effCtx, id)
+	if err != nil {
+		if appErr, ok := errors.IsAppError(err); ok {
+			c.Error(appErr)
+			return
+		}
+		logger.ErrorWithFields(ctx, err, map[string]interface{}{
+			"knowledge_id": id,
+		})
+		c.Error(errors.NewInternalServerError(err.Error()))
+		return
+	}
+
+	logger.Infof(ctx, "Knowledge reparse task submitted successfully, knowledge ID: %s", id)
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "Knowledge reparse task submitted",
 		"data":    knowledge,
 	})
 }
@@ -1187,5 +1289,188 @@ func (h *KnowledgeHandler) SearchKnowledge(c *gin.Context) {
 		"success":  true,
 		"data":     knowledges,
 		"has_more": hasMore,
+	})
+}
+
+// MoveKnowledgeRequest defines the request for moving knowledge items
+type MoveKnowledgeRequest struct {
+	KnowledgeIDs []string `json:"knowledge_ids" binding:"required,min=1"`
+	SourceKBID   string   `json:"source_kb_id"  binding:"required"`
+	TargetKBID   string   `json:"target_kb_id"  binding:"required"`
+	Mode         string   `json:"mode"          binding:"required,oneof=reuse_vectors reparse"`
+}
+
+// MoveKnowledgeResponse defines the response for move knowledge
+type MoveKnowledgeResponse struct {
+	TaskID         string `json:"task_id"`
+	SourceKBID     string `json:"source_kb_id"`
+	TargetKBID     string `json:"target_kb_id"`
+	KnowledgeCount int    `json:"knowledge_count"`
+	Message        string `json:"message"`
+}
+
+// MoveKnowledge moves knowledge items from one knowledge base to another (async task).
+func (h *KnowledgeHandler) MoveKnowledge(c *gin.Context) {
+	ctx := c.Request.Context()
+
+	var req MoveKnowledgeRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		logger.Error(ctx, "MoveKnowledge: failed to parse request", err)
+		c.Error(errors.NewBadRequestError("Invalid request parameters: " + err.Error()))
+		return
+	}
+
+	// Validate source != target
+	if req.SourceKBID == req.TargetKBID {
+		c.Error(errors.NewBadRequestError("Source and target knowledge base cannot be the same"))
+		return
+	}
+
+	tenantID, exists := c.Get(types.TenantIDContextKey.String())
+	if !exists {
+		c.Error(errors.NewUnauthorizedError("Unauthorized"))
+		return
+	}
+
+	// Validate source KB
+	sourceKB, err := h.kbService.GetKnowledgeBaseByID(ctx, req.SourceKBID)
+	if err != nil {
+		if goerrors.Is(err, repository.ErrKnowledgeBaseNotFound) {
+			c.Error(errors.NewNotFoundError("Source knowledge base not found"))
+			return
+		}
+		c.Error(errors.NewInternalServerError(err.Error()))
+		return
+	}
+	if sourceKB.TenantID != tenantID.(uint64) {
+		c.Error(errors.NewForbiddenError("No permission to access source knowledge base"))
+		return
+	}
+
+	// Validate target KB
+	targetKB, err := h.kbService.GetKnowledgeBaseByID(ctx, req.TargetKBID)
+	if err != nil {
+		if goerrors.Is(err, repository.ErrKnowledgeBaseNotFound) {
+			c.Error(errors.NewNotFoundError("Target knowledge base not found"))
+			return
+		}
+		c.Error(errors.NewInternalServerError(err.Error()))
+		return
+	}
+	if targetKB.TenantID != tenantID.(uint64) {
+		c.Error(errors.NewForbiddenError("No permission to access target knowledge base"))
+		return
+	}
+
+	// Validate type match
+	if sourceKB.Type != targetKB.Type {
+		c.Error(errors.NewBadRequestError("Source and target knowledge bases must be the same type"))
+		return
+	}
+
+	// Validate embedding model match
+	if sourceKB.EmbeddingModelID != targetKB.EmbeddingModelID {
+		c.Error(errors.NewBadRequestError("Source and target must use the same embedding model"))
+		return
+	}
+
+	// Validate all knowledge IDs belong to source KB and are in completed status
+	for _, kID := range req.KnowledgeIDs {
+		knowledge, err := h.kgService.GetKnowledgeByID(ctx, kID)
+		if err != nil {
+			c.Error(errors.NewBadRequestError(fmt.Sprintf("Knowledge item %s not found", kID)))
+			return
+		}
+		if knowledge.KnowledgeBaseID != req.SourceKBID {
+			c.Error(errors.NewBadRequestError(fmt.Sprintf("Knowledge item %s does not belong to the source knowledge base", kID)))
+			return
+		}
+		if knowledge.ParseStatus != types.ParseStatusCompleted {
+			c.Error(errors.NewBadRequestError(fmt.Sprintf("Knowledge item %s is not in completed status (current: %s)", kID, knowledge.ParseStatus)))
+			return
+		}
+	}
+
+	// Generate task ID
+	taskID := utils.GenerateTaskID("kg_move", tenantID.(uint64), req.SourceKBID)
+
+	// Create move payload
+	payload := types.KnowledgeMovePayload{
+		TenantID:     tenantID.(uint64),
+		TaskID:       taskID,
+		KnowledgeIDs: req.KnowledgeIDs,
+		SourceKBID:   req.SourceKBID,
+		TargetKBID:   req.TargetKBID,
+		Mode:         req.Mode,
+	}
+
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		logger.Errorf(ctx, "MoveKnowledge: failed to marshal payload: %v", err)
+		c.Error(errors.NewInternalServerError("Failed to create task"))
+		return
+	}
+
+	// Enqueue move task
+	task := asynq.NewTask(types.TypeKnowledgeMove, payloadBytes,
+		asynq.TaskID(taskID), asynq.Queue("default"), asynq.MaxRetry(3))
+	info, err := h.asynqClient.Enqueue(task)
+	if err != nil {
+		logger.Errorf(ctx, "MoveKnowledge: failed to enqueue task: %v", err)
+		c.Error(errors.NewInternalServerError("Failed to enqueue task"))
+		return
+	}
+
+	logger.Infof(ctx, "MoveKnowledge: task enqueued: %s, asynq_id: %s, source: %s, target: %s, count: %d",
+		taskID, info.ID, secutils.SanitizeForLog(req.SourceKBID), secutils.SanitizeForLog(req.TargetKBID), len(req.KnowledgeIDs))
+
+	// Save initial progress
+	initialProgress := &types.KnowledgeMoveProgress{
+		TaskID:     taskID,
+		SourceKBID: req.SourceKBID,
+		TargetKBID: req.TargetKBID,
+		Status:     types.KBCloneStatusPending,
+		Total:      len(req.KnowledgeIDs),
+		Progress:   0,
+		Message:    "Task queued, waiting to start...",
+		CreatedAt:  time.Now().Unix(),
+		UpdatedAt:  time.Now().Unix(),
+	}
+	if err := h.kgService.SaveKnowledgeMoveProgress(ctx, initialProgress); err != nil {
+		logger.Warnf(ctx, "MoveKnowledge: failed to save initial progress: %v", err)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data": MoveKnowledgeResponse{
+			TaskID:         taskID,
+			SourceKBID:     req.SourceKBID,
+			TargetKBID:     req.TargetKBID,
+			KnowledgeCount: len(req.KnowledgeIDs),
+			Message:        "Knowledge move task started",
+		},
+	})
+}
+
+// GetKnowledgeMoveProgress retrieves the progress of a knowledge move task.
+func (h *KnowledgeHandler) GetKnowledgeMoveProgress(c *gin.Context) {
+	ctx := c.Request.Context()
+
+	taskID := c.Param("task_id")
+	if taskID == "" {
+		c.Error(errors.NewBadRequestError("Task ID cannot be empty"))
+		return
+	}
+
+	progress, err := h.kgService.GetKnowledgeMoveProgress(ctx, taskID)
+	if err != nil {
+		logger.ErrorWithFields(ctx, err, nil)
+		c.Error(err)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    progress,
 	})
 }

@@ -188,25 +188,35 @@ func (c *Client) CreateKnowledgeFromFile(ctx context.Context,
 	return &response.Data, nil
 }
 
-// CreateKnowledgeFromURL creates a knowledge entry from a web URL
+// CreateKnowledgeFromURLRequest contains the parameters for creating a knowledge entry from a URL.
+// When FileName or FileType is provided (or the URL path has a known file extension such as .pdf/.docx/.doc/.txt/.md),
+// the server automatically switches to file-download mode instead of web-page crawling.
+type CreateKnowledgeFromURLRequest struct {
+	// URL is the target URL (required)
+	URL string `json:"url"`
+	// FileName is the optional file name; used to hint file-download mode when URL has no extension
+	FileName string `json:"file_name,omitempty"`
+	// FileType is the optional file type (e.g. "pdf"); used to hint file-download mode
+	FileType string `json:"file_type,omitempty"`
+	// EnableMultimodel is the optional flag to enable multimodal processing
+	EnableMultimodel *bool `json:"enable_multimodel,omitempty"`
+	// Title is the optional title for the knowledge entry
+	Title string `json:"title,omitempty"`
+	// TagID is the optional tag ID to associate with the knowledge entry
+	TagID string `json:"tag_id,omitempty"`
+}
+
+// CreateKnowledgeFromURL creates a knowledge entry from a URL.
+// When req.FileName or req.FileType is provided (or the URL path has a known file extension),
+// the server automatically switches to file-download mode instead of web-page crawling.
 func (c *Client) CreateKnowledgeFromURL(
 	ctx context.Context,
 	knowledgeBaseID string,
-	url string,
-	enableMultimodel *bool,
-	title string,
+	req CreateKnowledgeFromURLRequest,
 ) (*Knowledge, error) {
 	path := fmt.Sprintf("/api/v1/knowledge-bases/%s/knowledge/url", knowledgeBaseID)
 
-	reqBody := struct {
-		URL              string `json:"url"`
-		EnableMultimodel *bool  `json:"enable_multimodel"`
-		Title            string `json:"title"`
-	}{
-		URL:              url,
-		EnableMultimodel: enableMultimodel,
-		Title:            title,
-	}
+	reqBody := req
 
 	resp, err := c.doRequest(ctx, http.MethodPost, path, reqBody, nil)
 	if err != nil {
@@ -356,6 +366,45 @@ func (c *Client) UpdateKnowledge(ctx context.Context, knowledge *Knowledge) erro
 	return parseResponse(resp, &response)
 }
 
+// ReparseKnowledge triggers re-parsing of a knowledge entry
+// This method deletes existing document content and re-parses the knowledge asynchronously.
+// It's useful when you want to refresh the knowledge content with updated parsing configurations
+// or when the original parsing failed and you want to retry.
+//
+// Parameters:
+//   - ctx: Context for the request
+//   - knowledgeID: The ID of the knowledge entry to reparse
+//
+// Returns:
+//   - *Knowledge: The updated knowledge entry with status set to "pending"
+//   - error: Error information if the request fails
+//
+// Example:
+//
+//	knowledge, err := client.ReparseKnowledge(ctx, "knowledge-id-123")
+//	if err != nil {
+//	    log.Fatalf("Failed to reparse knowledge: %v", err)
+//	}
+//	fmt.Printf("Knowledge reparse task submitted, status: %s\n", knowledge.ParseStatus)
+func (c *Client) ReparseKnowledge(ctx context.Context, knowledgeID string) (*Knowledge, error) {
+	if knowledgeID == "" {
+		return nil, fmt.Errorf("knowledge ID cannot be empty")
+	}
+
+	path := fmt.Sprintf("/api/v1/knowledge/%s/reparse", knowledgeID)
+	resp, err := c.doRequest(ctx, http.MethodPost, path, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var response KnowledgeResponse
+	if err := parseResponse(resp, &response); err != nil {
+		return nil, err
+	}
+
+	return &response.Data, nil
+}
+
 // UpdateChunk updates a chunk's information
 // Updates information for a specific chunk under a knowledge document
 // Parameters:
@@ -382,4 +431,178 @@ func (c *Client) UpdateImageInfo(ctx context.Context,
 	}
 
 	return parseResponse(resp, &response)
+}
+
+// CreateManualKnowledgeRequest contains the parameters for creating a manual Markdown knowledge entry.
+type CreateManualKnowledgeRequest struct {
+	Title   string `json:"title"`
+	Content string `json:"content"`
+	TagID   string `json:"tag_id,omitempty"`
+}
+
+// UpdateManualKnowledgeRequest contains the parameters for updating a manual Markdown knowledge entry.
+type UpdateManualKnowledgeRequest struct {
+	Title   string `json:"title,omitempty"`
+	Content string `json:"content,omitempty"`
+}
+
+// BatchUpdateKnowledgeTagsRequest contains the mapping of knowledge IDs to tag IDs.
+type BatchUpdateKnowledgeTagsRequest struct {
+	Updates map[string]*string `json:"updates"` // knowledge_id -> tag_id (nil to clear)
+}
+
+// CreateManualKnowledge creates a knowledge entry from manual Markdown content.
+func (c *Client) CreateManualKnowledge(ctx context.Context, knowledgeBaseID string, request *CreateManualKnowledgeRequest) (*Knowledge, error) {
+	path := fmt.Sprintf("/api/v1/knowledge-bases/%s/knowledge/manual", knowledgeBaseID)
+	resp, err := c.doRequest(ctx, http.MethodPost, path, request, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var response KnowledgeResponse
+	if err := parseResponse(resp, &response); err != nil {
+		return nil, err
+	}
+
+	return &response.Data, nil
+}
+
+// UpdateManualKnowledge updates a manual Markdown knowledge entry.
+func (c *Client) UpdateManualKnowledge(ctx context.Context, knowledgeID string, request *UpdateManualKnowledgeRequest) (*Knowledge, error) {
+	path := fmt.Sprintf("/api/v1/knowledge/manual/%s", knowledgeID)
+	resp, err := c.doRequest(ctx, http.MethodPut, path, request, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var response KnowledgeResponse
+	if err := parseResponse(resp, &response); err != nil {
+		return nil, err
+	}
+
+	return &response.Data, nil
+}
+
+// FilterKnowledgeResponse represents the response from filter knowledge API
+type FilterKnowledgeResponse struct {
+	Success bool        `json:"success"`
+	Data    []Knowledge `json:"data"`
+	HasMore bool        `json:"has_more"`
+}
+
+// FilterKnowledge searches/filters knowledge entries across knowledge bases
+func (c *Client) FilterKnowledge(ctx context.Context, keyword string, offset, limit int, fileTypes []string, agentID string) ([]Knowledge, bool, error) {
+	queryParams := url.Values{}
+	if keyword != "" {
+		queryParams.Set("keyword", keyword)
+	}
+	queryParams.Set("offset", strconv.Itoa(offset))
+	queryParams.Set("limit", strconv.Itoa(limit))
+	if len(fileTypes) > 0 {
+		for _, ft := range fileTypes {
+			queryParams.Add("file_types", ft)
+		}
+	}
+	if agentID != "" {
+		queryParams.Set("agent_id", agentID)
+	}
+
+	resp, err := c.doRequest(ctx, http.MethodGet, "/api/v1/knowledge/search", nil, queryParams)
+	if err != nil {
+		return nil, false, err
+	}
+
+	var response FilterKnowledgeResponse
+	if err := parseResponse(resp, &response); err != nil {
+		return nil, false, err
+	}
+
+	return response.Data, response.HasMore, nil
+}
+
+// MoveKnowledgeRequest contains the parameters for moving knowledge between KBs
+type MoveKnowledgeRequest struct {
+	KnowledgeIDs []string `json:"knowledge_ids"`
+	SourceKBID   string   `json:"source_kb_id"`
+	TargetKBID   string   `json:"target_kb_id"`
+	Mode         string   `json:"mode"` // "reuse_vectors" or "reparse"
+}
+
+// MoveKnowledgeResponse represents the response from move knowledge API
+type MoveKnowledgeResponse struct {
+	TaskID         string `json:"task_id"`
+	SourceKBID     string `json:"source_kb_id"`
+	TargetKBID     string `json:"target_kb_id"`
+	KnowledgeCount int    `json:"knowledge_count"`
+	Message        string `json:"message"`
+}
+
+// MoveKnowledge moves knowledge items from one knowledge base to another (async task)
+func (c *Client) MoveKnowledge(ctx context.Context, req *MoveKnowledgeRequest) (*MoveKnowledgeResponse, error) {
+	resp, err := c.doRequest(ctx, http.MethodPost, "/api/v1/knowledge/move", req, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var result struct {
+		Success bool                   `json:"success"`
+		Data    *MoveKnowledgeResponse `json:"data"`
+	}
+	if err := parseResponse(resp, &result); err != nil {
+		return nil, err
+	}
+	return result.Data, nil
+}
+
+// KnowledgeMoveProgress represents the progress of a knowledge move task
+type KnowledgeMoveProgress struct {
+	TaskID    string `json:"task_id"`
+	Status    string `json:"status"`
+	Progress  int    `json:"progress"`
+	Total     int    `json:"total"`
+	Processed int    `json:"processed"`
+	Message   string `json:"message"`
+	Error     string `json:"error,omitempty"`
+}
+
+// GetKnowledgeMoveProgress gets the progress of a knowledge move task
+func (c *Client) GetKnowledgeMoveProgress(ctx context.Context, taskID string) (*KnowledgeMoveProgress, error) {
+	path := fmt.Sprintf("/api/v1/knowledge/move/progress/%s", taskID)
+	resp, err := c.doRequest(ctx, http.MethodGet, path, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var result struct {
+		Success bool                   `json:"success"`
+		Data    *KnowledgeMoveProgress `json:"data"`
+	}
+	if err := parseResponse(resp, &result); err != nil {
+		return nil, err
+	}
+	return result.Data, nil
+}
+
+// PreviewKnowledgeFile returns the file content for inline preview.
+// The caller is responsible for reading and closing the response body.
+func (c *Client) PreviewKnowledgeFile(ctx context.Context, knowledgeID string) (*http.Response, error) {
+	path := fmt.Sprintf("/api/v1/knowledge/%s/preview", knowledgeID)
+	return c.doRequest(ctx, http.MethodGet, path, nil, nil)
+}
+
+// BatchUpdateKnowledgeTags batch updates knowledge tags.
+// The updates map contains knowledge_id -> tag_id mappings. Set tag_id to nil to clear the tag.
+func (c *Client) BatchUpdateKnowledgeTags(ctx context.Context, updates map[string]*string) error {
+	request := &BatchUpdateKnowledgeTagsRequest{Updates: updates}
+	resp, err := c.doRequest(ctx, http.MethodPut, "/api/v1/knowledge/tags", request, nil)
+	if err != nil {
+		return err
+	}
+
+	var batchResponse struct {
+		Success bool   `json:"success"`
+		Message string `json:"message,omitempty"`
+	}
+
+	return parseResponse(resp, &batchResponse)
 }

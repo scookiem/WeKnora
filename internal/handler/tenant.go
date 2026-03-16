@@ -22,7 +22,33 @@ import (
 type TenantHandler struct {
 	service     interfaces.TenantService
 	userService interfaces.UserService
+	kbService   interfaces.KnowledgeBaseService
 	config      *config.Config
+}
+
+// authorizeTenantAccess checks that the authenticated user owns the target tenant
+// or has cross-tenant access privileges. Returns the current user on success.
+func (h *TenantHandler) authorizeTenantAccess(c *gin.Context, targetTenantID uint64) (*types.User, bool) {
+	ctx := c.Request.Context()
+
+	user, ok := ctx.Value(types.UserContextKey).(*types.User)
+	if !ok || user == nil {
+		c.Error(errors.NewUnauthorizedError("Authentication required"))
+		return nil, false
+	}
+
+	if user.TenantID == targetTenantID {
+		return user, true
+	}
+
+	if h.config != nil && h.config.Tenant != nil && h.config.Tenant.EnableCrossTenantAccess && user.CanAccessAllTenants {
+		return user, true
+	}
+
+	logger.Warnf(ctx, "User %s (tenant %d) attempted to access tenant %d without permission",
+		user.ID, user.TenantID, targetTenantID)
+	c.Error(errors.NewForbiddenError("Access denied: you do not have permission to access this tenant"))
+	return nil, false
 }
 
 // NewTenantHandler creates a new tenant handler instance with the provided service
@@ -32,10 +58,11 @@ type TenantHandler struct {
 //   - config: Application configuration
 //
 // Returns a pointer to the newly created TenantHandler
-func NewTenantHandler(service interfaces.TenantService, userService interfaces.UserService, config *config.Config) *TenantHandler {
+func NewTenantHandler(service interfaces.TenantService, userService interfaces.UserService, kbService interfaces.KnowledgeBaseService, config *config.Config) *TenantHandler {
 	return &TenantHandler{
 		service:     service,
 		userService: userService,
+		kbService:   kbService,
 		config:      config,
 	}
 }
@@ -114,9 +141,12 @@ func (h *TenantHandler) GetTenant(c *gin.Context) {
 		return
 	}
 
+	if _, ok := h.authorizeTenantAccess(c, id); !ok {
+		return
+	}
+
 	tenant, err := h.service.GetTenantByID(ctx, id)
 	if err != nil {
-		// Check if this is an application-specific error
 		if appErr, ok := errors.IsAppError(err); ok {
 			logger.Error(ctx, "Failed to retrieve tenant: application error", appErr)
 			c.Error(appErr)
@@ -157,6 +187,10 @@ func (h *TenantHandler) UpdateTenant(c *gin.Context) {
 		return
 	}
 
+	if _, ok := h.authorizeTenantAccess(c, id); !ok {
+		return
+	}
+
 	var tenantData types.Tenant
 	if err := c.ShouldBindJSON(&tenantData); err != nil {
 		logger.Error(ctx, "Failed to parse request parameters", err)
@@ -169,7 +203,6 @@ func (h *TenantHandler) UpdateTenant(c *gin.Context) {
 	tenantData.ID = id
 	updatedTenant, err := h.service.UpdateTenant(ctx, &tenantData)
 	if err != nil {
-		// Check if this is an application-specific error
 		if appErr, ok := errors.IsAppError(err); ok {
 			logger.Error(ctx, "Failed to update tenant: application error", appErr)
 			c.Error(appErr)
@@ -215,10 +248,13 @@ func (h *TenantHandler) DeleteTenant(c *gin.Context) {
 		return
 	}
 
+	if _, ok := h.authorizeTenantAccess(c, id); !ok {
+		return
+	}
+
 	logger.Infof(ctx, "Deleting tenant, ID: %d", id)
 
 	if err := h.service.DeleteTenant(ctx, id); err != nil {
-		// Check if this is an application-specific error
 		if appErr, ok := errors.IsAppError(err); ok {
 			logger.Error(ctx, "Failed to delete tenant: application error", appErr)
 			c.Error(appErr)
@@ -249,23 +285,16 @@ func (h *TenantHandler) DeleteTenant(c *gin.Context) {
 func (h *TenantHandler) ListTenants(c *gin.Context) {
 	ctx := c.Request.Context()
 
-	tenants, err := h.service.ListTenants(ctx)
-	if err != nil {
-		// Check if this is an application-specific error
-		if appErr, ok := errors.IsAppError(err); ok {
-			logger.Error(ctx, "Failed to retrieve tenant list: application error", appErr)
-			c.Error(appErr)
-		} else {
-			logger.ErrorWithFields(ctx, err, nil)
-			c.Error(errors.NewInternalServerError("Failed to retrieve tenant list").WithDetails(err.Error()))
-		}
+	tenant, ok := ctx.Value(types.TenantInfoContextKey).(*types.Tenant)
+	if !ok || tenant == nil {
+		c.Error(errors.NewUnauthorizedError("Authentication required"))
 		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"data": gin.H{
-			"items": tenants,
+			"items": []*types.Tenant{tenant},
 		},
 	})
 }
@@ -439,7 +468,7 @@ type AgentConfigRequest struct {
 // @Router       /tenants/kv/agent-config [get]
 func (h *TenantHandler) GetTenantAgentConfig(c *gin.Context) {
 	ctx := c.Request.Context()
-	tenant := ctx.Value(types.TenantInfoContextKey).(*types.Tenant)
+	tenant, _ := types.TenantInfoFromContext(ctx)
 	if tenant == nil {
 		logger.Error(ctx, "Tenant is empty")
 		c.Error(errors.NewBadRequestError("Tenant is empty"))
@@ -529,7 +558,7 @@ func (h *TenantHandler) updateTenantAgentConfigInternal(c *gin.Context) {
 	}
 
 	// Get existing tenant
-	tenant := ctx.Value(types.TenantInfoContextKey).(*types.Tenant)
+	tenant, _ := types.TenantInfoFromContext(ctx)
 	if tenant == nil {
 		logger.Error(ctx, "Tenant is empty")
 		c.Error(errors.NewBadRequestError("Tenant is empty"))
@@ -599,6 +628,18 @@ func (h *TenantHandler) GetTenantKV(c *gin.Context) {
 	case "prompt-templates":
 		h.GetPromptTemplates(c)
 		return
+	case "parser-engine-config":
+		h.GetTenantParserEngineConfig(c)
+		return
+	case "storage-engine-config":
+		h.GetTenantStorageEngineConfig(c)
+		return
+	case "chat-history-config":
+		h.GetTenantChatHistoryConfig(c)
+		return
+	case "retrieval-config":
+		h.GetTenantRetrievalConfig(c)
+		return
 	default:
 		logger.Info(ctx, "KV key not supported", "key", key)
 		c.Error(errors.NewBadRequestError("unsupported key"))
@@ -633,6 +674,18 @@ func (h *TenantHandler) UpdateTenantKV(c *gin.Context) {
 	case "conversation-config":
 		h.updateTenantConversationInternal(c)
 		return
+	case "parser-engine-config":
+		h.updateTenantParserEngineConfigInternal(c)
+		return
+	case "storage-engine-config":
+		h.updateTenantStorageEngineConfigInternal(c)
+		return
+	case "chat-history-config":
+		h.updateTenantChatHistoryConfigInternal(c)
+		return
+	case "retrieval-config":
+		h.updateTenantRetrievalConfigInternal(c)
+		return
 	default:
 		logger.Info(ctx, "KV key not supported", "key", key)
 		c.Error(errors.NewBadRequestError("unsupported key"))
@@ -658,7 +711,7 @@ func (h *TenantHandler) updateTenantWebSearchConfigInternal(c *gin.Context) {
 		return
 	}
 
-	tenant := ctx.Value(types.TenantInfoContextKey).(*types.Tenant)
+	tenant, _ := types.TenantInfoFromContext(ctx)
 	if tenant == nil {
 		logger.Error(ctx, "Tenant is empty")
 		c.Error(errors.NewBadRequestError("Tenant is empty"))
@@ -699,7 +752,7 @@ func (h *TenantHandler) GetTenantWebSearchConfig(c *gin.Context) {
 	ctx := c.Request.Context()
 	logger.Info(ctx, "Start getting tenant web search config")
 	// Get tenant
-	tenant := ctx.Value(types.TenantInfoContextKey).(*types.Tenant)
+	tenant, _ := types.TenantInfoFromContext(ctx)
 	if tenant == nil {
 		logger.Error(ctx, "Tenant is empty")
 		c.Error(errors.NewBadRequestError("Tenant is empty"))
@@ -710,6 +763,110 @@ func (h *TenantHandler) GetTenantWebSearchConfig(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"data":    tenant.WebSearchConfig,
+	})
+}
+
+// GetTenantParserEngineConfig returns the tenant's parser engine config (MinerU endpoint, API key, etc.).
+func (h *TenantHandler) GetTenantParserEngineConfig(c *gin.Context) {
+	ctx := c.Request.Context()
+	tenant, _ := types.TenantInfoFromContext(ctx)
+	if tenant == nil {
+		logger.Error(ctx, "Tenant is empty")
+		c.Error(errors.NewBadRequestError("Tenant is empty"))
+		return
+	}
+	data := tenant.ParserEngineConfig
+	if data == nil {
+		data = &types.ParserEngineConfig{}
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    data,
+	})
+}
+
+// updateTenantParserEngineConfigInternal updates the tenant's parser engine config.
+func (h *TenantHandler) updateTenantParserEngineConfigInternal(c *gin.Context) {
+	ctx := c.Request.Context()
+	var cfg types.ParserEngineConfig
+	if err := c.ShouldBindJSON(&cfg); err != nil {
+		logger.Error(ctx, "Failed to parse request parameters", err)
+		c.Error(errors.NewValidationError("Invalid request data").WithDetails(err.Error()))
+		return
+	}
+	tenant, _ := types.TenantInfoFromContext(ctx)
+	if tenant == nil {
+		logger.Error(ctx, "Tenant is empty")
+		c.Error(errors.NewBadRequestError("Tenant is empty"))
+		return
+	}
+	tenant.ParserEngineConfig = &cfg
+	updatedTenant, err := h.service.UpdateTenant(ctx, tenant)
+	if err != nil {
+		if appErr, ok := errors.IsAppError(err); ok {
+			c.Error(appErr)
+		} else {
+			logger.ErrorWithFields(ctx, err, nil)
+			c.Error(errors.NewInternalServerError("Failed to update tenant parser engine config").WithDetails(err.Error()))
+		}
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    updatedTenant.ParserEngineConfig,
+		"message": "解析引擎配置已更新",
+	})
+}
+
+// GetTenantStorageEngineConfig returns the tenant's storage engine config (Local, MinIO, COS parameters).
+func (h *TenantHandler) GetTenantStorageEngineConfig(c *gin.Context) {
+	ctx := c.Request.Context()
+	tenant, _ := types.TenantInfoFromContext(ctx)
+	if tenant == nil {
+		logger.Error(ctx, "Tenant is empty")
+		c.Error(errors.NewBadRequestError("Tenant is empty"))
+		return
+	}
+	data := tenant.StorageEngineConfig
+	if data == nil {
+		data = &types.StorageEngineConfig{}
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    data,
+	})
+}
+
+// updateTenantStorageEngineConfigInternal updates the tenant's storage engine config.
+func (h *TenantHandler) updateTenantStorageEngineConfigInternal(c *gin.Context) {
+	ctx := c.Request.Context()
+	var cfg types.StorageEngineConfig
+	if err := c.ShouldBindJSON(&cfg); err != nil {
+		logger.Error(ctx, "Failed to parse request parameters", err)
+		c.Error(errors.NewValidationError("Invalid request data").WithDetails(err.Error()))
+		return
+	}
+	tenant, _ := types.TenantInfoFromContext(ctx)
+	if tenant == nil {
+		logger.Error(ctx, "Tenant is empty")
+		c.Error(errors.NewBadRequestError("Tenant is empty"))
+		return
+	}
+	tenant.StorageEngineConfig = &cfg
+	updatedTenant, err := h.service.UpdateTenant(ctx, tenant)
+	if err != nil {
+		if appErr, ok := errors.IsAppError(err); ok {
+			c.Error(appErr)
+		} else {
+			logger.ErrorWithFields(ctx, err, nil)
+			c.Error(errors.NewInternalServerError("Failed to update tenant storage engine config").WithDetails(err.Error()))
+		}
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    updatedTenant.StorageEngineConfig,
+		"message": "存储引擎配置已更新",
 	})
 }
 
@@ -781,7 +938,7 @@ func validateConversationConfig(req *types.ConversationConfig) error {
 // @Router       /tenants/kv/conversation-config [get]
 func (h *TenantHandler) GetTenantConversationConfig(c *gin.Context) {
 	ctx := c.Request.Context()
-	tenant := ctx.Value(types.TenantInfoContextKey).(*types.Tenant)
+	tenant, _ := types.TenantInfoFromContext(ctx)
 	if tenant == nil {
 		logger.Error(ctx, "Tenant is empty")
 		c.Error(errors.NewBadRequestError("Tenant is empty"))
@@ -818,7 +975,7 @@ func (h *TenantHandler) updateTenantConversationInternal(c *gin.Context) {
 	}
 
 	// Get existing tenant
-	tenant := ctx.Value(types.TenantInfoContextKey).(*types.Tenant)
+	tenant, _ := types.TenantInfoFromContext(ctx)
 	if tenant == nil {
 		logger.Error(ctx, "Tenant is empty")
 		c.Error(errors.NewBadRequestError("Tenant is empty"))
@@ -869,5 +1026,179 @@ func (h *TenantHandler) GetPromptTemplates(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"data":    templates,
+	})
+}
+
+// GetTenantChatHistoryConfig returns the tenant's chat history KB configuration.
+func (h *TenantHandler) GetTenantChatHistoryConfig(c *gin.Context) {
+	ctx := c.Request.Context()
+	tenant, _ := types.TenantInfoFromContext(ctx)
+	if tenant == nil {
+		logger.Error(ctx, "Tenant is empty")
+		c.Error(errors.NewBadRequestError("Tenant is empty"))
+		return
+	}
+	data := tenant.ChatHistoryConfig
+	if data == nil {
+		data = &types.ChatHistoryConfig{}
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    data,
+	})
+}
+
+// updateTenantChatHistoryConfigInternal updates the tenant's chat history KB configuration.
+// When enabled with an embedding model and no KB exists yet, it auto-creates a hidden KB.
+func (h *TenantHandler) updateTenantChatHistoryConfigInternal(c *gin.Context) {
+	ctx := c.Request.Context()
+
+	// The frontend sends: enabled, embedding_model_id
+	// knowledge_base_id is managed internally.
+	var req types.ChatHistoryConfig
+	if err := c.ShouldBindJSON(&req); err != nil {
+		logger.Error(ctx, "Failed to parse request parameters", err)
+		c.Error(errors.NewValidationError("Invalid request data").WithDetails(err.Error()))
+		return
+	}
+
+	tenant, _ := types.TenantInfoFromContext(ctx)
+	if tenant == nil {
+		logger.Error(ctx, "Tenant is empty")
+		c.Error(errors.NewBadRequestError("Tenant is empty"))
+		return
+	}
+
+	existing := tenant.ChatHistoryConfig
+
+	// Build the new config, preserving the internally-managed knowledge_base_id
+	cfg := &types.ChatHistoryConfig{
+		Enabled:          req.Enabled,
+		EmbeddingModelID: req.EmbeddingModelID,
+		KnowledgeBaseID:  "", // will be set below
+	}
+
+	// Carry over existing KB ID if the embedding model hasn't changed
+	if existing != nil && existing.KnowledgeBaseID != "" {
+		if existing.EmbeddingModelID == req.EmbeddingModelID {
+			cfg.KnowledgeBaseID = existing.KnowledgeBaseID
+		} else {
+			// Embedding model changed — the old KB is incompatible.
+			// We'll create a new one below. The old KB remains but is orphaned (can be cleaned up later).
+			logger.Infof(ctx, "Embedding model changed from %s to %s, will create new chat history KB", existing.EmbeddingModelID, req.EmbeddingModelID)
+		}
+	}
+
+	// Auto-create hidden KB if enabled + model set + no KB yet
+	if cfg.Enabled && cfg.EmbeddingModelID != "" && cfg.KnowledgeBaseID == "" {
+		kb := &types.KnowledgeBase{
+			Name:             "__chat_history__",
+			Type:             types.KnowledgeBaseTypeDocument,
+			IsTemporary:      true,
+			Description:      "Auto-managed knowledge base for chat history message indexing",
+			EmbeddingModelID: cfg.EmbeddingModelID,
+		}
+		createdKB, err := h.kbService.CreateKnowledgeBase(ctx, kb)
+		if err != nil {
+			logger.ErrorWithFields(ctx, err, nil)
+			c.Error(errors.NewInternalServerError("Failed to create chat history knowledge base").WithDetails(err.Error()))
+			return
+		}
+		cfg.KnowledgeBaseID = createdKB.ID
+		logger.Infof(ctx, "Auto-created chat history KB: id=%s, embedding_model=%s", createdKB.ID, cfg.EmbeddingModelID)
+	}
+
+	tenant.ChatHistoryConfig = cfg
+	updatedTenant, err := h.service.UpdateTenant(ctx, tenant)
+	if err != nil {
+		if appErr, ok := errors.IsAppError(err); ok {
+			c.Error(appErr)
+		} else {
+			logger.ErrorWithFields(ctx, err, nil)
+			c.Error(errors.NewInternalServerError("Failed to update chat history config").WithDetails(err.Error()))
+		}
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    updatedTenant.ChatHistoryConfig,
+		"message": "Chat history configuration updated successfully",
+	})
+}
+
+// GetTenantRetrievalConfig returns the tenant's global retrieval configuration.
+func (h *TenantHandler) GetTenantRetrievalConfig(c *gin.Context) {
+	ctx := c.Request.Context()
+	tenant, _ := types.TenantInfoFromContext(ctx)
+	if tenant == nil {
+		logger.Error(ctx, "Tenant is empty")
+		c.Error(errors.NewBadRequestError("Tenant is empty"))
+		return
+	}
+	data := tenant.RetrievalConfig
+	if data == nil {
+		data = &types.RetrievalConfig{}
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    data,
+	})
+}
+
+// updateTenantRetrievalConfigInternal updates the tenant's global retrieval configuration.
+func (h *TenantHandler) updateTenantRetrievalConfigInternal(c *gin.Context) {
+	ctx := c.Request.Context()
+
+	var cfg types.RetrievalConfig
+	if err := c.ShouldBindJSON(&cfg); err != nil {
+		logger.Error(ctx, "Failed to parse request parameters", err)
+		c.Error(errors.NewValidationError("Invalid request data").WithDetails(err.Error()))
+		return
+	}
+
+	// Validate thresholds
+	if cfg.VectorThreshold < 0 || cfg.VectorThreshold > 1 {
+		c.Error(errors.NewBadRequestError("vector_threshold must be between 0 and 1"))
+		return
+	}
+	if cfg.KeywordThreshold < 0 || cfg.KeywordThreshold > 1 {
+		c.Error(errors.NewBadRequestError("keyword_threshold must be between 0 and 1"))
+		return
+	}
+	if cfg.RerankThreshold < 0 || cfg.RerankThreshold > 1 {
+		c.Error(errors.NewBadRequestError("rerank_threshold must be between 0 and 1"))
+		return
+	}
+	if cfg.EmbeddingTopK < 0 || cfg.EmbeddingTopK > 200 {
+		c.Error(errors.NewBadRequestError("embedding_top_k must be between 0 and 200"))
+		return
+	}
+	if cfg.RerankTopK < 0 || cfg.RerankTopK > 200 {
+		c.Error(errors.NewBadRequestError("rerank_top_k must be between 0 and 200"))
+		return
+	}
+
+	tenant, _ := types.TenantInfoFromContext(ctx)
+	if tenant == nil {
+		logger.Error(ctx, "Tenant is empty")
+		c.Error(errors.NewBadRequestError("Tenant is empty"))
+		return
+	}
+
+	tenant.RetrievalConfig = &cfg
+	updatedTenant, err := h.service.UpdateTenant(ctx, tenant)
+	if err != nil {
+		if appErr, ok := errors.IsAppError(err); ok {
+			c.Error(appErr)
+		} else {
+			logger.ErrorWithFields(ctx, err, nil)
+			c.Error(errors.NewInternalServerError("Failed to update retrieval config").WithDetails(err.Error()))
+		}
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    updatedTenant.RetrievalConfig,
+		"message": "Retrieval configuration updated successfully",
 	})
 }

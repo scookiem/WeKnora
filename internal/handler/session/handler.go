@@ -304,3 +304,75 @@ func (h *Handler) DeleteSession(c *gin.Context) {
 		"message": "Session deleted successfully",
 	})
 }
+
+// batchDeleteRequest represents the request body for batch deleting sessions
+type batchDeleteRequest struct {
+	IDs       []string `json:"ids"`
+	DeleteAll bool     `json:"delete_all"`
+}
+
+// BatchDeleteSessions godoc
+// @Summary      批量删除会话
+// @Description  根据ID列表批量删除对话会话，或设置 delete_all=true 删除当前租户的所有会话
+// @Tags         会话
+// @Accept       json
+// @Produce      json
+// @Param        request  body      batchDeleteRequest  true  "批量删除请求"
+// @Success      200      {object}  map[string]interface{}  "删除结果"
+// @Failure      400      {object}  errors.AppError         "请求参数错误"
+// @Security     Bearer
+// @Security     ApiKeyAuth
+// @Router       /sessions/batch [delete]
+func (h *Handler) BatchDeleteSessions(c *gin.Context) {
+	ctx := c.Request.Context()
+
+	var req batchDeleteRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		logger.Errorf(ctx, "Invalid batch delete request: %v", err)
+		c.Error(errors.NewBadRequestError("invalid request"))
+		return
+	}
+
+	if req.DeleteAll {
+		if err := h.sessionService.DeleteAllSessions(ctx); err != nil {
+			logger.ErrorWithFields(ctx, err, nil)
+			c.Error(errors.NewInternalServerError(err.Error()))
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"success": true,
+			"message": "All sessions deleted successfully",
+		})
+		return
+	}
+
+	if len(req.IDs) == 0 {
+		c.Error(errors.NewBadRequestError("ids are required when delete_all is false"))
+		return
+	}
+
+	// Sanitize all IDs
+	sanitizedIDs := make([]string, 0, len(req.IDs))
+	for _, id := range req.IDs {
+		sanitized := secutils.SanitizeForLog(id)
+		if sanitized != "" {
+			sanitizedIDs = append(sanitizedIDs, sanitized)
+		}
+	}
+
+	if len(sanitizedIDs) == 0 {
+		c.Error(errors.NewBadRequestError("no valid session IDs provided"))
+		return
+	}
+
+	if err := h.sessionService.BatchDeleteSessions(ctx, sanitizedIDs); err != nil {
+		logger.ErrorWithFields(ctx, err, nil)
+		c.Error(errors.NewInternalServerError(err.Error()))
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "Sessions deleted successfully",
+	})
+}

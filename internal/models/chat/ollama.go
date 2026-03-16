@@ -105,6 +105,10 @@ func (c *OllamaChat) Chat(ctx context.Context, messages []Message, opts *ChatOpt
 	// 使用 Ollama 客户端发送请求
 	err := c.ollamaService.Chat(ctx, chatReq, func(resp ollamaapi.ChatResponse) error {
 		responseContent = resp.Message.Content
+		// 当 Content 为空但 Thinking 有内容时（如推理模型未正确配置 thinking 参数），使用 Thinking 作为兜底
+		if responseContent == "" && resp.Message.Thinking != "" {
+			responseContent = resp.Message.Thinking
+		}
 		toolCalls = c.toolCallTo(resp.Message.ToolCalls)
 
 		// 获取token计数
@@ -159,8 +163,27 @@ func (c *OllamaChat) ChatStream(
 	go func() {
 		defer close(streamChan)
 
+		hasThinking := false
 		err := c.ollamaService.Chat(ctx, chatReq, func(resp ollamaapi.ChatResponse) error {
+			// 发送思考内容（支持 Qwen3、DeepSeek 等推理模型）
+			if resp.Message.Thinking != "" {
+				hasThinking = true
+				streamChan <- types.StreamResponse{
+					ResponseType: types.ResponseTypeThinking,
+					Content:      resp.Message.Thinking,
+					Done:         false,
+				}
+			}
+
 			if resp.Message.Content != "" {
+				// 思考阶段结束后，发送思考完成事件
+				if hasThinking {
+					streamChan <- types.StreamResponse{
+						ResponseType: types.ResponseTypeThinking,
+						Done:         true,
+					}
+					hasThinking = false
+				}
 				streamChan <- types.StreamResponse{
 					ResponseType: types.ResponseTypeAnswer,
 					Content:      resp.Message.Content,
@@ -173,6 +196,35 @@ func (c *OllamaChat) ChatStream(
 					ResponseType: types.ResponseTypeToolCall,
 					ToolCalls:    c.toolCallTo(resp.Message.ToolCalls),
 					Done:         false,
+				}
+
+				// Extract and stream content from special tools (complete, not incremental)
+				for _, tc := range resp.Message.ToolCalls {
+					switch tc.Function.Name {
+					case "final_answer":
+						if answer, ok := tc.Function.Arguments["answer"].(string); ok && answer != "" {
+							streamChan <- types.StreamResponse{
+								ResponseType: types.ResponseTypeAnswer,
+								Content:      answer,
+								Done:         false,
+								Data: map[string]interface{}{
+									"source": "final_answer_tool",
+								},
+							}
+						}
+					case "thinking":
+						if thought, ok := tc.Function.Arguments["thought"].(string); ok && thought != "" {
+							streamChan <- types.StreamResponse{
+								ResponseType: types.ResponseTypeThinking,
+								Content:      thought,
+								Done:         false,
+								Data: map[string]interface{}{
+									"source":       "thinking_tool",
+									"tool_call_id": tooli2s(tc.Function.Index),
+								},
+							}
+						}
+					}
 				}
 			}
 

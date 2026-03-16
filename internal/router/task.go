@@ -21,6 +21,7 @@ type AsynqTaskParams struct {
 	TagService           interfaces.KnowledgeTagService
 	ChunkExtractor       interfaces.TaskHandler `name:"chunkExtractor"`
 	DataTableSummary     interfaces.TaskHandler `name:"dataTableSummary"`
+	ImageMultimodal      interfaces.TaskHandler `name:"imageMultimodal"`
 }
 
 func getAsynqRedisClientOpt() *asynq.RedisClientOpt {
@@ -89,6 +90,9 @@ func RunAsynqServer(params AsynqTaskParams) *asynq.ServeMux {
 	// Register KB clone handler
 	mux.HandleFunc(types.TypeKBClone, params.KnowledgeService.ProcessKBClone)
 
+	// Register knowledge move handler
+	mux.HandleFunc(types.TypeKnowledgeMove, params.KnowledgeService.ProcessKnowledgeMove)
+
 	// Register knowledge list delete handler
 	mux.HandleFunc(types.TypeKnowledgeListDelete, params.KnowledgeService.ProcessKnowledgeListDelete)
 
@@ -97,6 +101,9 @@ func RunAsynqServer(params AsynqTaskParams) *asynq.ServeMux {
 
 	// Register KB delete handler
 	mux.HandleFunc(types.TypeKBDelete, params.KnowledgeBaseService.ProcessKBDelete)
+
+	// Register image multimodal handler
+	mux.HandleFunc(types.TypeImageMultimodal, params.ImageMultimodal.Handle)
 
 	go func() {
 		// Start the server

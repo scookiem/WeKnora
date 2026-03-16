@@ -23,11 +23,15 @@ type KnowledgeService interface {
 		tagID string,
 	) (*types.Knowledge, error)
 	// CreateKnowledgeFromURL creates knowledge from a URL.
+	// When fileName or fileType is provided (or the URL path has a known file extension),
+	// the URL is treated as a direct file download instead of a web page crawl.
 	// tagID is optional - when provided, the knowledge will be assigned to the specified tag/category.
 	CreateKnowledgeFromURL(
 		ctx context.Context,
 		kbID string,
 		url string,
+		fileName string,
+		fileType string,
 		enableMultimodel *bool,
 		title string,
 		tagID string,
@@ -78,6 +82,8 @@ type KnowledgeService interface {
 		knowledgeID string,
 		payload *types.ManualKnowledgePayload,
 	) (*types.Knowledge, error)
+	// ReparseKnowledge deletes existing document content and re-parses the knowledge asynchronously.
+	ReparseKnowledge(ctx context.Context, knowledgeID string) (*types.Knowledge, error)
 	// CloneKnowledgeBase clones knowledge to another knowledge base.
 	CloneKnowledgeBase(ctx context.Context, srcID, dstID string) error
 	// UpdateImageInfo updates image information for a knowledge chunk.
@@ -133,12 +139,18 @@ type KnowledgeService interface {
 	ProcessSummaryGeneration(ctx context.Context, t *asynq.Task) error
 	// ProcessKBClone handles Asynq knowledge base clone tasks
 	ProcessKBClone(ctx context.Context, t *asynq.Task) error
+	// ProcessKnowledgeMove handles Asynq knowledge move tasks
+	ProcessKnowledgeMove(ctx context.Context, t *asynq.Task) error
 	// ProcessKnowledgeListDelete handles Asynq knowledge list delete tasks
 	ProcessKnowledgeListDelete(ctx context.Context, t *asynq.Task) error
 	// GetKBCloneProgress retrieves the progress of a knowledge base clone task
 	GetKBCloneProgress(ctx context.Context, taskID string) (*types.KBCloneProgress, error)
 	// SaveKBCloneProgress saves the progress of a knowledge base clone task
 	SaveKBCloneProgress(ctx context.Context, progress *types.KBCloneProgress) error
+	// GetKnowledgeMoveProgress retrieves the progress of a knowledge move task
+	GetKnowledgeMoveProgress(ctx context.Context, taskID string) (*types.KnowledgeMoveProgress, error)
+	// SaveKnowledgeMoveProgress saves the progress of a knowledge move task
+	SaveKnowledgeMoveProgress(ctx context.Context, progress *types.KnowledgeMoveProgress) error
 	// GetFAQImportProgress retrieves the progress of an FAQ import task
 	GetFAQImportProgress(ctx context.Context, taskID string) (*types.FAQImportProgress, error)
 	// UpdateLastFAQImportResultDisplayStatus updates the display status of FAQ import result

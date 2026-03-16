@@ -30,6 +30,7 @@ type qaRequestContext struct {
 	knowledgeIDs      []string
 	summaryModelID    string
 	webSearchEnabled  bool
+	enableMemory      bool // Whether memory feature is enabled
 	mentionedItems    types.MentionedItems
 	effectiveTenantID uint64 // when using shared agent, tenant ID for model/KB/MCP resolution; 0 = use context tenant
 }
@@ -166,6 +167,7 @@ func (h *Handler) parseQARequest(c *gin.Context, logPrefix string) (*qaRequestCo
 		knowledgeIDs:      secutils.SanitizeForLogArray(knowledgeIDs),
 		summaryModelID:    secutils.SanitizeForLog(request.SummaryModelID),
 		webSearchEnabled:  request.WebSearchEnabled,
+		enableMemory:      request.EnableMemory,
 		mentionedItems:    convertMentionedItems(request.MentionedItems),
 		effectiveTenantID: effectiveTenantID,
 	}
@@ -404,6 +406,9 @@ func (h *Handler) executeNormalModeQA(reqCtx *qaRequestContext, generateTitle bo
 			return nil
 		}
 		streamCtx.assistantMessage.Content += data.Content
+		if data.IsFallback {
+			streamCtx.assistantMessage.IsFallback = true
+		}
 		if data.Done {
 			// Prevent duplicate completion handling
 			if completionHandled {
@@ -415,7 +420,7 @@ func (h *Handler) executeNormalModeQA(reqCtx *qaRequestContext, generateTitle bo
 			// Content already contains <think>...</think> tags from chat_completion_stream.go
 			// Use session's tenant for message update (asyncCtx may have effectiveTenantID when using shared agent)
 			updateCtx := context.WithValue(streamCtx.asyncCtx, types.TenantIDContextKey, reqCtx.session.TenantID)
-			h.completeAssistantMessage(updateCtx, streamCtx.assistantMessage)
+			h.completeAssistantMessage(updateCtx, streamCtx.assistantMessage, reqCtx.query)
 			// Emit EventAgentComplete - this will trigger handleComplete which sends the SSE complete event
 			// Note: Don't cancel context here, let the SSE handler close naturally after receiving the complete event
 			streamCtx.eventBus.Emit(streamCtx.asyncCtx, event.Event{
@@ -449,6 +454,7 @@ func (h *Handler) executeNormalModeQA(reqCtx *qaRequestContext, generateTitle bo
 			reqCtx.webSearchEnabled,
 			streamCtx.eventBus,
 			reqCtx.customAgent,
+			reqCtx.enableMemory,
 		)
 		if err != nil {
 			logger.ErrorWithFields(streamCtx.asyncCtx, err, nil)
@@ -521,7 +527,7 @@ func (h *Handler) executeAgentModeQA(reqCtx *qaRequestContext) {
 			}
 			// Use session's tenant for message update (session belongs to session.TenantID; asyncCtx may have effectiveTenantID when using shared agent)
 			updateCtx := context.WithValue(streamCtx.asyncCtx, types.TenantIDContextKey, reqCtx.session.TenantID)
-			h.completeAssistantMessage(updateCtx, streamCtx.assistantMessage)
+			h.completeAssistantMessage(updateCtx, streamCtx.assistantMessage, reqCtx.query)
 			logger.Infof(streamCtx.asyncCtx, "Agent QA service completed for session: %s", sessionID)
 		}()
 
@@ -555,9 +561,15 @@ func (h *Handler) executeAgentModeQA(reqCtx *qaRequestContext) {
 		reqCtx.requestID, streamCtx.eventBus, reqCtx.session.Title == "")
 }
 
-// completeAssistantMessage marks an assistant message as complete and updates it
-func (h *Handler) completeAssistantMessage(ctx context.Context, assistantMessage *types.Message) {
+// completeAssistantMessage marks an assistant message as complete, updates it,
+// and asynchronously indexes the Q&A pair into the chat history knowledge base.
+func (h *Handler) completeAssistantMessage(ctx context.Context, assistantMessage *types.Message, userQuery string) {
 	assistantMessage.UpdatedAt = time.Now()
 	assistantMessage.IsCompleted = true
 	_ = h.messageService.UpdateMessage(ctx, assistantMessage)
+
+	// Asynchronously index the Q&A pair into the chat history knowledge base for vector search.
+	// Use WithoutCancel so the goroutine survives after the HTTP request context is done.
+	bgCtx := context.WithoutCancel(ctx)
+	go h.messageService.IndexMessageToKB(bgCtx, userQuery, assistantMessage.Content, assistantMessage.ID, assistantMessage.SessionID)
 }

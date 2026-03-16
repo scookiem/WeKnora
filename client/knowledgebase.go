@@ -6,6 +6,7 @@ package client
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"time"
@@ -13,22 +14,23 @@ import (
 
 // KnowledgeBase represents a knowledge base
 type KnowledgeBase struct {
-	ID                    string                `json:"id"`
-	Name                  string                `json:"name"` // Name must be unique within the same tenant
-	Type                  string                `json:"type"`
-	IsTemporary           bool                  `json:"is_temporary"`
-	Description           string                `json:"description"`
-	TenantID              uint64                `json:"tenant_id"`
-	ChunkingConfig        ChunkingConfig        `json:"chunking_config"`
-	ImageProcessingConfig ImageProcessingConfig `json:"image_processing_config"`
-	FAQConfig             *FAQConfig            `json:"faq_config"`
-	EmbeddingModelID      string                `json:"embedding_model_id"`
-	SummaryModelID        string                `json:"summary_model_id"`
-	VLMConfig             VLMConfig             `json:"vlm_config"`
-	StorageConfig         StorageConfig         `json:"cos_config"`
-	ExtractConfig         *ExtractConfig        `json:"extract_config"`
-	CreatedAt             time.Time             `json:"created_at"`
-	UpdatedAt             time.Time             `json:"updated_at"`
+	ID                    string                 `json:"id"`
+	Name                  string                 `json:"name"` // Name must be unique within the same tenant
+	Type                  string                 `json:"type"`
+	IsTemporary           bool                   `json:"is_temporary"`
+	Description           string                 `json:"description"`
+	TenantID              uint64                 `json:"tenant_id"`
+	ChunkingConfig        ChunkingConfig         `json:"chunking_config"`
+	ImageProcessingConfig ImageProcessingConfig  `json:"image_processing_config"`
+	FAQConfig             *FAQConfig             `json:"faq_config"`
+	EmbeddingModelID      string                 `json:"embedding_model_id"`
+	SummaryModelID        string                 `json:"summary_model_id"`
+	VLMConfig             VLMConfig              `json:"vlm_config"`
+	StorageProviderConfig *StorageProviderConfig `json:"storage_provider_config"`
+	StorageConfig         StorageConfig          `json:"storage_config"`
+	ExtractConfig         *ExtractConfig         `json:"extract_config"`
+	CreatedAt             time.Time              `json:"created_at"`
+	UpdatedAt             time.Time              `json:"updated_at"`
 	// Computed fields (not stored in database)
 	KnowledgeCount  int64 `json:"knowledge_count"`
 	ChunkCount      int64 `json:"chunk_count"`
@@ -67,7 +69,13 @@ type VLMConfig struct {
 	ModelID string `json:"model_id"`
 }
 
-// StorageConfig represents the storage configuration
+// StorageProviderConfig stores the KB-level storage provider selection.
+type StorageProviderConfig struct {
+	Provider string `json:"provider"`
+}
+
+// StorageConfig represents the legacy storage configuration (cos_config).
+// Deprecated: use StorageProviderConfig for provider selection.
 type StorageConfig struct {
 	SecretID   string `json:"secret_id"`
 	SecretKey  string `json:"secret_key"`
@@ -97,6 +105,25 @@ type GraphRelation struct {
 	Node1 string `json:"node1"`
 	Node2 string `json:"node2"`
 	Type  string `json:"type"`
+}
+
+// UnmarshalJSON keeps backward compatibility for legacy responses that still
+// use `cos_config` instead of `storage_config`.
+func (kb *KnowledgeBase) UnmarshalJSON(data []byte) error {
+	type alias KnowledgeBase
+	aux := struct {
+		*alias
+		LegacyStorageConfig *StorageConfig `json:"cos_config"`
+	}{
+		alias: (*alias)(kb),
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	if aux.LegacyStorageConfig != nil && kb.StorageConfig == (StorageConfig{}) {
+		kb.StorageConfig = *aux.LegacyStorageConfig
+	}
+	return nil
 }
 
 // KnowledgeBaseResponse knowledge base response
@@ -277,6 +304,46 @@ func (c *Client) HybridSearch(ctx context.Context, knowledgeBaseID string, param
 	}
 
 	var response HybridSearchResponse
+	if err := parseResponse(resp, &response); err != nil {
+		return nil, err
+	}
+
+	return response.Data, nil
+}
+
+// TogglePinKnowledgeBase toggles the pin status of a knowledge base
+func (c *Client) TogglePinKnowledgeBase(ctx context.Context, knowledgeBaseID string) (*KnowledgeBase, error) {
+	path := fmt.Sprintf("/api/v1/knowledge-bases/%s/pin", knowledgeBaseID)
+	resp, err := c.doRequest(ctx, http.MethodPost, path, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var response KnowledgeBaseResponse
+	if err := parseResponse(resp, &response); err != nil {
+		return nil, err
+	}
+
+	return &response.Data, nil
+}
+
+// MoveTarget represents a knowledge base that can receive moved knowledge
+type MoveTarget struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Type        string `json:"type"`
+	Description string `json:"description"`
+}
+
+// ListMoveTargets lists knowledge bases eligible as move targets for the given source KB
+func (c *Client) ListMoveTargets(ctx context.Context, knowledgeBaseID string) ([]KnowledgeBase, error) {
+	path := fmt.Sprintf("/api/v1/knowledge-bases/%s/move-targets", knowledgeBaseID)
+	resp, err := c.doRequest(ctx, http.MethodGet, path, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var response KnowledgeBaseListResponse
 	if err := parseResponse(resp, &response); err != nil {
 		return nil, err
 	}
